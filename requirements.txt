@@ -1,0 +1,2 @@
+simo>=1.5.9
+python-openzwave==0.4.19
