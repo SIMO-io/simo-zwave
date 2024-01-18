@@ -6,10 +6,11 @@ from django.contrib import messages
 from django.views.generic import TemplateView
 from django.shortcuts import render, redirect
 from django.utils.safestring import mark_safe
+from simo.core.events import GatewayObjectCommand
 from simo.core.models import Gateway
 from .models import ZwaveNode, NodeValue
 from .forms import AdminNodeValueInlineForm, ZwaveGatewaySelectForm
-from .events import ZwaveControllerCommand
+
 
 
 
@@ -109,9 +110,8 @@ class ZwaveNodeAdmin(admin.ModelAdmin):
                 pk=request.session['add_nodes_gateway_pk']
             )
             if 'new_nodes_only' not in request.GET:
-                ZwaveControllerCommand(
-                    request.session.get('add_nodes_gateway_pk'),
-                    'add_node', doSecurity=True
+                GatewayObjectCommand(
+                    ctx['gateway'], zwave_command='add_node'
                 ).publish()
             ctx['gateway'].config['last_controller_command'] = time.time()
             ctx['gateway'].save()
@@ -120,9 +120,8 @@ class ZwaveNodeAdmin(admin.ModelAdmin):
             )
 
             if request.method == 'POST' and 'finish' in request.POST:
-                ZwaveControllerCommand(
-                    request.session.get('add_nodes_gateway_pk'),
-                    'cancel_command'
+                GatewayObjectCommand(
+                    ctx['gateway'], zwave_command='cancel_command'
                 ).publish()
                 request.session.pop('add_nodes_gateway_pk')
                 ctx['new_nodes'] = ZwaveNode.objects.filter(
@@ -167,9 +166,8 @@ class ZwaveNodeAdmin(admin.ModelAdmin):
                 pk=request.session['remove_nodes_gateway_pk']
             )
             if 'removed_nodes_only' not in request.GET:
-                ZwaveControllerCommand(
-                    request.session.get('remove_nodes_gateway_pk'),
-                    'remove_node'
+                GatewayObjectCommand(
+                    ctx['gateway'], zwave_command='remove_node'
                 ).publish()
                 request.session['org_nodes_list'] = [
                     str(n) for n in
@@ -186,9 +184,8 @@ class ZwaveNodeAdmin(admin.ModelAdmin):
             ]
 
             if request.method == 'POST' and 'finish' in request.POST:
-                ZwaveControllerCommand(
-                    request.session.get('add_nodes_gateway_pk'),
-                    'cancel_command'
+                GatewayObjectCommand(
+                    ctx['gateway'], zwave_command='cancel_command'
                 ).publish()
                 request.session.pop('remove_nodes_gateway_pk')
                 request.session.pop('org_nodes_list')

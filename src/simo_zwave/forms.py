@@ -8,7 +8,7 @@ from django.utils.translation import gettext_lazy as _
 from simo.core.utils.form_widgets import AdminReadonlyFieldWidget, EmptyFieldWidget
 from simo.core.forms import BaseGatewayForm, BaseComponentForm, NumericSensorForm
 from simo.core.models import Gateway
-from simo.core.events import ObjectCommand
+from simo.core.events import GatewayObjectCommand
 from .models import ZwaveNode, NodeValue
 from .widgets import AdminNodeValueValueWidget, AdminNodeValueSelectWidget
 
@@ -28,8 +28,6 @@ class AdminNodeValueInlineForm(forms.ModelForm):
     class Meta:
         model = NodeValue
         fields = 'label', 'value', 'units', 'genre',
-
-
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -113,15 +111,17 @@ class AdminNodeValueInlineForm(forms.ModelForm):
             set_val = True
         obj = super().save(commit=commit)
         if set_val:
-            ObjectCommand(
-                self.instance, **{'set_val': self.cleaned_data['value']}
-            ).publish()
+            for gateway in Gateway.objects.filter(type__startswith='simo_zwave'):
+                GatewayObjectCommand(
+                    gateway, self.instance,
+                    set_val=self.cleaned_data['value']
+                ).publish()
         return obj
 
 
 class ZwaveGatewaySelectForm(forms.Form):
     gateway = forms.ModelChoiceField(
-        queryset=Gateway.objects.filter(type='zwave')
+        queryset=Gateway.objects.filter(type__startswith='simo_zwave')
     )
 
 

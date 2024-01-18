@@ -3,7 +3,7 @@ from django.db import models
 from django.db.models.signals import post_save, post_delete
 from django.dispatch import receiver
 from simo.core.models import Gateway, Component
-from .events import ZwaveControllerCommand
+from simo.core.events import GatewayObjectCommand
 
 
 
@@ -32,23 +32,23 @@ class ZwaveNode(models.Model):
 
     def kill_node(self):
         print("kill node %s" % str(self.node_id))
-        ZwaveControllerCommand(
-            self.gateway.id, 'remove_failed_node', self.node_id
+        GatewayObjectCommand(
+            self.gateway, zwave_command='remove_failed_node', node_id=self.node_id
         ).publish()
 
     def request_network_update(self):
-        ZwaveControllerCommand(
-            self.gateway.id, 'request_network_update', self.node_id
+        GatewayObjectCommand(
+            self.gateway, zwave_command='request_network_update', node_id=self.node_id
         ).publish()
 
     def send_node_information(self):
-        ZwaveControllerCommand(
-            self.gateway.id, 'send_node_information', self.node_id
+        GatewayObjectCommand(
+            self.gateway, zwave_command='send_node_information', node_id=self.node_id
         ).publish()
 
     def has_node_failed(self):
-        ZwaveControllerCommand(
-            self.gateway.id, 'has_node_failed', self.node_id
+        GatewayObjectCommand(
+            self.gateway, zwave_command='has_node_failed', node_id=self.node_id
         ).publish()
 
 
@@ -99,8 +99,8 @@ def set_component_value_of_node_value(sender, instance, created, *args, **kwargs
 
 @receiver(post_delete, sender=ZwaveNode)
 def node_post_delete(sender, instance, *args, **kwargs):
-    ZwaveControllerCommand(
-        instance.gateway.id, 'remove_failed_node', instance.node_id
+    GatewayObjectCommand(
+        instance.gateway, zwave_command='remove_failed_node', node_id=instance.node_id
     ).publish()
 
 

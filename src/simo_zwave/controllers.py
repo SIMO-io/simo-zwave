@@ -11,7 +11,6 @@ from .forms import (
     RGBLightComponentConfigForm, ZwaveNumericSensorConfigForm
 )
 
-
 class ZwaveBinarySensor(BinarySensor):
     gateway_class = ZwaveGatewayHandler
     config_form = BasicZwaveComponentConfigForm

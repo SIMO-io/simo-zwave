@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import sys
 from openzwave.network import ZWaveNetwork
 from openzwave.option import ZWaveOption
 import paho.mqtt.client as mqtt
@@ -9,11 +10,10 @@ import time
 from django.conf import settings
 from simo.core.models import Component
 from simo.core.gateways import BaseGatewayHandler
-from simo.core.events import ObjectCommand, get_event_obj
+from simo.core.events import GatewayObjectCommand, get_event_obj
 from simo.conf import dynamic_settings
 from .forms import ZwaveGatewayForm
 from .models import ZwaveNode, NodeValue
-from .events import ZwaveControllerCommand
 
 
 class ZwaveGatewayHandler(BaseGatewayHandler):
@@ -78,20 +78,26 @@ class ZwaveGatewayHandler(BaseGatewayHandler):
 
     def on_mqtt_connect(self, mqtt_client, userdata, flags, rc):
         print("Connected to mqtt with result code " + str(rc))
-        mqtt_client.subscribe(ZwaveControllerCommand.TOPIC)
-        mqtt_client.subscribe(ObjectCommand.TOPIC)
+        command = GatewayObjectCommand(self.gateway_instance)
+        mqtt_client.subscribe(command.get_topic())
 
     def on_mqtt_message(self, client, userdata, msg):
         payload = json.loads(msg.payload)
 
-        if msg.topic == ZwaveControllerCommand.TOPIC:
-            if not payload['gateway_id'] == self.gateway_instance.id:
+        if 'zwave_command' in payload:
+            if not hasattr(self.network, payload['zwave_command']):
                 return
+            zwave_command = getattr(
+                self.network.controller, payload['zwave_command']
+            )
+            if 'node_id' in payload:
+                kwargs = {'node_id': payload['node_id']}
+            else:
+                kwargs = {}
             try:
-                getattr(self.network.controller, payload['command'])(
-                    *payload.get('args', []), **payload.get('kwargs', {})
-                )
-            except:
+                zwave_command(**kwargs)
+            except Exception as e:
+                print(e, file=sys.stderr)
                 return
             else:
                 print("Command %s initiated!" % payload['command'])
@@ -100,42 +106,29 @@ class ZwaveGatewayHandler(BaseGatewayHandler):
                 and 'last_controller_command' in self.gateway_instance.config:
                     self.gateway_instance.config.pop('last_controller_command')
                     self.gateway_instance.save()
+            return
 
-        elif msg.topic == ObjectCommand.TOPIC:
-            target = get_event_obj(payload)
-            if isinstance(target, Component):
-                if not target or target.gateway.type != self.uid:
-                    return
-                if 'set_val' not in payload.get("kwargs"):
-                    return
+        target = get_event_obj(payload)
+        if isinstance(target, Component):
+            if 'set_val' not in payload:
+                return
+            if isinstance(target, NodeValue):
+                node_val = target
+            else:
                 try:
                     node_val = NodeValue.objects.get(
                         pk=target.config.get('zwave_item', 0)
                     )
                 except:
                     return
-
-                try:
-                    nodev = self.network.nodes[
-                        node_val.node.node_id
-                    ].values[node_val.value_id]
-                    nodev.data = payload['kwargs']['set_val']
-                except Exception as e:
-                    logging.error(e, exc_info=True)
-                    pass
-
-            elif isinstance(target, NodeValue):
+            try:
                 nodev = self.network.nodes[
-                    target.node.node_id
-                ].values[target.value_id]
-                try:
-                    nodev.data = payload['kwargs']['set_val']
-                except Exception as e:
-                    logging.error(e, exc_info=True)
-                    pass
-
-
-
+                    node_val.node.node_id
+                ].values[node_val.value_id]
+                nodev.data = payload['set_val']
+            except Exception as e:
+                logging.error(e, exc_info=True)
+                pass
 
     def update_node_stats(self, node_model):
         update_related_component_stats = False
