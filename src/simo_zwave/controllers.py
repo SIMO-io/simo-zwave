@@ -3,7 +3,7 @@ from simo.core.controllers import (
     BinarySensor, NumericSensor,
     Switch, Dimmer, RGBWLight
 )
-from simo.core.events import ObjectCommand
+from simo.core.events import GatewayObjectCommand
 from .models import NodeValue
 from .gateways import ZwaveGatewayHandler
 from .forms import (
@@ -44,7 +44,7 @@ class ZwaveDimmer(Dimmer):
         zwave_amplitude = conf.get('zwave_max', 99.0) - conf.get('zwave_min', 0.0)
         set_val = float_value * zwave_amplitude + conf.get('zwave_min', 0.0)
 
-        ObjectCommand(self.component, **{'set_val': set_val}).publish()
+        return super()._send_to_device(set_val)
 
     def _receive_from_device(self, val):
         conf = self.component.config
