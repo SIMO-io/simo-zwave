@@ -24,6 +24,7 @@ class ZwaveGatewayHandler(BaseGatewayHandler):
     def run(self, exit):
         print("Starting Zwave Gateway")
         mqtt_client = mqtt.Client()
+        mqtt_client.username_pw_set('root', settings.SECRET_KEY)
 
         try:
             config_path = dynamic_settings['zwave__ozwave_config_path_community']
@@ -52,7 +53,9 @@ class ZwaveGatewayHandler(BaseGatewayHandler):
 
             mqtt_client.on_connect = self.on_mqtt_connect
             mqtt_client.on_message = self.on_mqtt_message
-            mqtt_client.connect(host=settings.MQTT_HOST, port=settings.MQTT_PORT)
+            mqtt_client.connect(
+                host=settings.MQTT_HOST, port=settings.MQTT_PORT
+            )
             mqtt_client.loop_start()
 
             seconds_counter = 0
