@@ -134,31 +134,24 @@ class ZwaveGatewayHandler(BaseGatewayHandler):
                 pass
 
     def update_node_stats(self, node_model):
-        update_related_component_stats = False
 
         try:
             zwave_node = self.network.nodes[node_model.node_id]
             node_model.stats = zwave_node.stats
         except KeyError:
             node_model.alive = False
-            return
-
-        if zwave_node.product_name and not node_model.product_name:
+        else:
             node_model.product_name = zwave_node.product_name
-        if zwave_node.type and not node_model.product_type:
             node_model.product_type = zwave_node.type
-        if node_model.alive != (not zwave_node.is_failed):
             node_model.alive = not zwave_node.is_failed
-            update_related_component_stats = True
-        if node_model.battery_level != zwave_node.get_battery_level():
             node_model.battery_level = zwave_node.get_battery_level()
-            update_related_component_stats = True
+
         node_model.save()
-        if update_related_component_stats:
-            for node_val in node_model.node_values.all().exclude(component=None):
-                node_val.component.alive = node_model.alive
-                node_val.component.battery_level = node_model.battery_level
-                node_val.component.save()
+
+        for node_val in node_model.node_values.all().exclude(component=None):
+            node_val.component.alive = node_model.alive
+            node_val.component.battery_level = node_model.battery_level
+            node_val.component.save()
 
     def perform_periodic_maintenance(self):
         self.gateway_instance.refresh_from_db()
