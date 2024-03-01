@@ -1,8 +1,8 @@
-from django.conf.urls import include, url
+from django.urls import include, re_path
 from .views import update_zwave_library
 
 urlpatterns = [
-    url(
+    re_path(
         r"^update-library/$",
         update_zwave_library, name='update-zwave-library'
     ),
