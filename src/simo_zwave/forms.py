@@ -1,14 +1,17 @@
 from django import forms
 from django.db.models import Q
-from django.contrib import admin
-from django.contrib.admin.widgets import AutocompleteSelect
-from django.utils.safestring import mark_safe
-from simo.core.forms import BaseGatewayForm
+from dal import forward
 from django.utils.translation import gettext_lazy as _
+from simo.core.utils.validators import validate_slaves
 from simo.core.utils.form_widgets import AdminReadonlyFieldWidget, EmptyFieldWidget
 from simo.core.forms import BaseGatewayForm, BaseComponentForm, NumericSensorForm
 from simo.core.models import Gateway
 from simo.core.events import GatewayObjectCommand
+from simo.core.models import Component
+from simo.core.form_fields import (
+    Select2ModelChoiceField, Select2ListChoiceField,
+    Select2ModelMultipleChoiceField
+)
 from .models import ZwaveNode, NodeValue
 from .widgets import AdminNodeValueValueWidget, AdminNodeValueSelectWidget
 
@@ -174,6 +177,37 @@ class ZwaveNumericSensorConfigForm(BasicZwaveComponentConfigForm, NumericSensorF
     pass
 
 
+class ZwaveSwitchConfigForm(BasicZwaveComponentConfigForm):
+    slaves = Select2ModelMultipleChoiceField(
+        queryset=Component.objects.filter(
+            base_type__in=(
+                'dimmer', 'switch', 'blinds', 'script'
+            )
+        ),
+        url='autocomplete-component',
+        forward=[
+            forward.Const(['dimmer', 'switch', 'blinds', 'script'], 'base_type')
+        ], required=False
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance.pk and 'slaves' in self.fields:
+            self.fields['slaves'].initial = self.instance.slaves.all()
+
+    def clean_slaves(self):
+        if 'slaves' not in self.cleaned_data:
+            return
+        if not self.cleaned_data['slaves'] or not self.instance:
+            return self.cleaned_data['slaves']
+        return validate_slaves(self.cleaned_data['slaves'], self.instance)
+
+    def save(self, commit=True):
+        obj = super().save(commit=commit)
+        if commit and 'slaves' in self.cleaned_data:
+            obj.slaves.set(self.cleaned_data['slaves'])
+        return obj
+
 
 class ZwaveKnobComponentConfigForm(BasicZwaveComponentConfigForm):
     min = forms.FloatField(
@@ -188,12 +222,30 @@ class ZwaveKnobComponentConfigForm(BasicZwaveComponentConfigForm):
     zwave_max = forms.FloatField(
         initial=99, help_text="Maximum value expected by Zwave node."
     )
+    slaves = Select2ModelMultipleChoiceField(
+        queryset=Component.objects.filter(
+            base_type__in=('dimmer',),
+        ),
+        url='autocomplete-component',
+        forward=(forward.Const(['dimmer', ], 'base_type'),),
+        required=False
+    )
 
-    def clean(self):
-        super().clean()
-        if not self.instance.id:
-            self.cleaned_data['value_units'] = '%'
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance.pk and 'slaves' in self.fields:
+            self.fields['slaves'].initial = self.instance.slaves.all()
 
+    def clean_slaves(self):
+        if not self.cleaned_data['slaves'] or not self.instance:
+            return self.cleaned_data['slaves']
+        return validate_slaves(self.cleaned_data['slaves'], self.instance)
+
+    def save(self, commit=True):
+        obj = super().save(commit=commit)
+        if commit and 'slaves' in self.cleaned_data:
+            obj.slaves.set(self.cleaned_data['slaves'])
+        return obj
 
 class RGBLightComponentConfigForm(BasicZwaveComponentConfigForm):
     has_white = forms.BooleanField(

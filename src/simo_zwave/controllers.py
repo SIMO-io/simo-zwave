@@ -1,10 +1,7 @@
-from django.utils.translation import gettext_lazy as _
 from simo.core.controllers import (
     BinarySensor, NumericSensor,
     Switch, Dimmer, RGBWLight
 )
-from simo.core.events import GatewayObjectCommand
-from .models import NodeValue
 from .gateways import ZwaveGatewayHandler
 from .forms import (
     BasicZwaveComponentConfigForm, ZwaveKnobComponentConfigForm,

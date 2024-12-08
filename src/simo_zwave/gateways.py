@@ -111,27 +111,46 @@ class ZwaveGatewayHandler(BaseGatewayHandler):
                     self.gateway_instance.save()
             return
 
+        if 'bulk_send' in payload:
+            components = {c.id: c for c in Component.objects.filter(
+                gateway__type=self.uid,
+                id__in=[int(id) for id in payload['bulk_send'].keys()]
+            )}
+            for comp_id, value in payload['bulk_send'].items():
+                if int(comp_id) not in components:
+                    continue
+                comp = components[int(comp_id)]
+                try:
+                    value = comp.controller._string_to_vals(str(value))[0]
+                except:
+                    pass
+                self.send_val(components[int(comp_id)], value)
+            return
+
         target = get_event_obj(payload)
         if isinstance(target, Component):
             if 'set_val' not in payload:
                 return
-            if isinstance(target, NodeValue):
-                node_val = target
-            else:
-                try:
-                    node_val = NodeValue.objects.get(
-                        pk=target.config.get('zwave_item', 0)
-                    )
-                except:
-                    return
+            self.send_val(target, payload['set_val'])
+
+    def send_val(self, target, val):
+        if isinstance(target, NodeValue):
+            node_val = target
+        else:
             try:
-                nodev = self.network.nodes[
-                    node_val.node.node_id
-                ].values[node_val.value_id]
-                nodev.data = payload['set_val']
-            except Exception as e:
-                logging.error(e, exc_info=True)
-                pass
+                node_val = NodeValue.objects.get(
+                    pk=target.config.get('zwave_item', 0)
+                )
+            except:
+                return
+        try:
+            nodev = self.network.nodes[
+                node_val.node.node_id
+            ].values[node_val.value_id]
+            nodev.data = val
+        except Exception as e:
+            logging.error(e, exc_info=True)
+            pass
 
     def update_node_stats(self, node_model):
 
