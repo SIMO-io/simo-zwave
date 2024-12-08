@@ -5,7 +5,8 @@ from simo.core.controllers import (
 from .gateways import ZwaveGatewayHandler
 from .forms import (
     BasicZwaveComponentConfigForm, ZwaveKnobComponentConfigForm,
-    RGBLightComponentConfigForm, ZwaveNumericSensorConfigForm
+    RGBLightComponentConfigForm, ZwaveNumericSensorConfigForm,
+    ZwaveSwitchConfigForm
 )
 
 class ZwaveBinarySensor(BinarySensor):
@@ -22,7 +23,7 @@ class ZwaveNumericSensor(NumericSensor):
 
 class ZwaveSwitch(Switch):
     gateway_class = ZwaveGatewayHandler
-    config_form = BasicZwaveComponentConfigForm
+    config_form = ZwaveSwitchConfigForm
 
     def _receive_from_device(self, val):
         return super()._receive_from_device(bool(val))
