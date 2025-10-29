@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simo-zwave"
-version = "1.0.9"
+version = "1.0.10"
 authors = [
-  { name="Simanas Venčkauskas", email="simanas@simo.io" },
+  { name="Simon V.", email="simon@simo.io" },
 ]
 description = "OpenZwave integration for SIMO.io"
 readme = "README.md"
