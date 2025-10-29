@@ -19,6 +19,7 @@ from .models import ZwaveNode, NodeValue
 class ZwaveGatewayHandler(BaseGatewayHandler):
     name = "Zwave"
     config_form = ZwaveGatewayForm
+    auto_create = True
     network = None
 
     def run(self, exit):
