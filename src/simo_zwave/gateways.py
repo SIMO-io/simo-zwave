@@ -150,7 +150,6 @@ class ZwaveGatewayHandler(BaseGatewayHandler):
             ].values[node_val.value_id]
             nodev.data = val
         except Exception as e:
-            logging.error(e, exc_info=True)
             pass
 
     def update_node_stats(self, node_model):

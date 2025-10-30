@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simo-zwave"
-version = "1.0.10"
+version = "1.0.11"
 authors = [
   { name="Simon V.", email="simon@simo.io" },
 ]
