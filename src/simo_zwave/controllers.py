@@ -13,8 +13,9 @@ class ZwaveBinarySensor(BinarySensor):
     gateway_class = ZwaveGatewayHandler
     config_form = BasicZwaveComponentConfigForm
 
-    def _receive_from_device(self, val):
-        return super()._receive_from_device(bool(val))
+    def _receive_from_device(self, val, **kwargs):
+        # Ensure boolean mapping, propagate is_alive/battery_level if provided
+        return super()._receive_from_device(bool(val), **kwargs)
 
 class ZwaveNumericSensor(NumericSensor):
     gateway_class = ZwaveGatewayHandler
@@ -25,8 +26,8 @@ class ZwaveSwitch(Switch):
     gateway_class = ZwaveGatewayHandler
     config_form = ZwaveSwitchConfigForm
 
-    def _receive_from_device(self, val):
-        return super()._receive_from_device(bool(val))
+    def _receive_from_device(self, val, **kwargs):
+        return super()._receive_from_device(bool(val), **kwargs)
 
 
 class ZwaveDimmer(Dimmer):
@@ -44,32 +45,35 @@ class ZwaveDimmer(Dimmer):
 
         return super()._send_to_device(set_val)
 
-    def _receive_from_device(self, val):
+    def _receive_from_device(self, val, **kwargs):
         conf = self.component.config
 
         zwave_amplitude = conf.get('zwave_max', 99.0) - conf.get('zwave_min', 0.0)
-        float_value = (val - conf.get('zwave_min', 0.0)) / zwave_amplitude
+        try:
+            float_value = (val - conf.get('zwave_min', 0.0)) / zwave_amplitude
+        except Exception:
+            float_value = 0
 
         com_amplitude = conf.get('max', 99.0) - conf.get('min', 0.0)
         set_val = float_value * com_amplitude + conf.get('min', 0.0)
 
-        return super()._receive_from_device(set_val)
+        return super()._receive_from_device(set_val, **kwargs)
 
 
 class ZwaveRGBWLight(RGBWLight):
     gateway_class = ZwaveGatewayHandler
     config_form = RGBLightComponentConfigForm
 
-    def _receive_from_device(self, val):
+    def _receive_from_device(self, val, **kwargs):
         # TODO: need to addapt to map type RGBWLight value.
-        return super()._receive_from_device(val)
+        return super()._receive_from_device(val, **kwargs)
 
 
 class ZwaveButton(Button):
     gateway_class = ZwaveGatewayHandler
     config_form = BasicZwaveComponentConfigForm
 
-    def _receive_from_device(self, val):
+    def _receive_from_device(self, val, **kwargs):
         # Map Z-Wave JS Central Scene event values to Button states.
         # Accept both numeric codes and string labels.
         mapping_num = {
@@ -94,11 +98,11 @@ class ZwaveButton(Button):
             if isinstance(val, (int, float)):
                 v = mapping_num.get(int(val))
                 if v:
-                    return super()._receive_from_device(v)
+                    return super()._receive_from_device(v, **kwargs)
             elif isinstance(val, str):
                 v = mapping_str.get(val) or val.lower()
                 # accept already-normalized values too
-                return super()._receive_from_device(v)
+                return super()._receive_from_device(v, **kwargs)
         except Exception:
             pass
         # Fallback: ignore unknowns
