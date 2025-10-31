@@ -191,96 +191,29 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             except Exception:
                 pass
             return
-        # Fetch defined value ids
+        # Resolve a writable ValueID using resolver (falls back to driver model)
         try:
-            resp = self._async_call(self._client.async_send_command({
-                'command': 'node.get_defined_value_ids',
-                'nodeId': nv.node.node_id,
-            }))
+            resolved = self._async_call(self._resolve_value_id_async(
+                nv.node.node_id, cc, None, None, None, nv.label or (comp.name if comp else None), desired_value=nv.value
+            ))
         except Exception:
-            try:
-                self.logger.error(f"NV pk={nv.pk} get_defined_value_ids failed", exc_info=True)
-            except Exception:
-                pass
-            return
-        items = resp
-        if isinstance(items, dict):
-            items = items.get('valueIds') or items.get('result') or []
-        if not isinstance(items, list):
-            try:
-                self.logger.info(f"NV pk={nv.pk} has no valueIds list; type={type(items)}")
-            except Exception:
-                pass
-            return
-        # filter by CC
-        def getf(item, key, fallback=None):
-            if isinstance(item, dict):
-                return item.get(key, fallback)
-            trans = {'commandClass': 'command_class', 'propertyKey': 'property_key', 'propertyName': 'property_name'}
-            return getattr(item, trans.get(key, key), fallback)
-        cands = [i for i in items if getf(i, 'commandClass') == cc]
-        try:
-            self.logger.info(f"NV pk={nv.pk} valueIds={len(items)} cc={cc} candidates={len(cands)}")
-        except Exception:
-            pass
-        # For switches/dimmers prefer 'targetValue'
-        cands_target = [i for i in cands if getf(i, 'property') == 'targetValue'] or cands
-        # If multiple endpoints, try to match by currentValue against our stored value
-        chosen = None
-        if base_type in ('switch', 'dimmer'):
-            desired = nv.value
-            # normalize desired for dimmer
-            if base_type == 'dimmer' and isinstance(desired, (int, float)):
-                desired = int(desired)
-            for item in cands_target:
-                vid = {'commandClass': getf(item, 'commandClass'), 'endpoint': getf(item, 'endpoint') or 0,
-                       'property': 'currentValue'}
-                try:
-                    cur = self._async_call(self._client.async_send_command({
-                        'command': 'node.get_value', 'nodeId': nv.node.node_id, 'valueId': vid
-                    }))
-                    cur_val = cur.get('value') if isinstance(cur, dict) else None
-                    try:
-                        self.logger.info(f"NV pk={nv.pk} probe ep={vid['endpoint']} currentValue={cur_val} desired={desired}")
-                    except Exception:
-                        pass
-                    if base_type == 'switch':
-                        if isinstance(cur_val, bool) and isinstance(nv.value, bool) and cur_val == nv.value:
-                            chosen = item
-                            break
-                    else:
-                        try:
-                            if cur_val is not None and abs(int(cur_val) - int(desired)) <= 5:
-                                chosen = item
-                                break
-                        except Exception:
-                            pass
-                except Exception:
-                    try:
-                        self.logger.error(f"NV pk={nv.pk} get_value failed for ep={vid['endpoint']}", exc_info=True)
-                    except Exception:
-                        pass
-                    continue
-        if not chosen and cands_target:
-            chosen = cands_target[0]
-            try:
-                self.logger.info(f"NV pk={nv.pk} fallback choose ep={getf(chosen,'endpoint') or 0} prop={getf(chosen,'property')}")
-            except Exception:
-                pass
-        if not chosen:
+            resolved = None
+        if not resolved:
             try:
                 self.logger.info(f"NV pk={nv.pk} no suitable target found; skipping")
             except Exception:
                 pass
             return
         # Persist mapping
-        nv.command_class = getf(chosen, 'commandClass')
-        nv.endpoint = getf(chosen, 'endpoint') or 0
-        nv.property = 'targetValue'
-        nv.property_key = None
+        nv.command_class = resolved.get('commandClass')
+        nv.endpoint = resolved.get('endpoint') or 0
+        nv.property = resolved.get('property')
+        nv.property_key = resolved.get('propertyKey')
         nv.save(update_fields=['command_class', 'endpoint', 'property', 'property_key'])
         try:
-            self.logger.info(f"Migrated NV pk={nv.pk} to CC={nv.command_class} ep={nv.endpoint} prop=targetValue")
+            self.logger.info(
+                f"Migrated NV pk={nv.pk} to CC={nv.command_class} ep={nv.endpoint} prop={nv.property}"
+            )
         except Exception:
             pass
 
@@ -444,13 +377,13 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         try:
             resp = await self._client.async_send_command({'command': 'node.get_defined_value_ids', 'nodeId': node_id})
         except Exception:
-            return None
+            resp = None
 
         items = resp
         if isinstance(resp, dict):
             items = resp.get('valueIds') or resp.get('result') or []
         if not isinstance(items, list):
-            return None
+            items = []
 
         def getf(item, key, fallback=None):
             if isinstance(item, dict):
@@ -494,18 +427,46 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         elif isinstance(desired_value, (int, float)):
             expected_type = 'number'
 
-        # Preload metadata for candidates with matching CC/endpoint only (limit scope)
         meta_cache: Dict[int, Dict[str, Any]] = {}
+        # If server returned nothing, fall back to driver model values
+        if not items and getattr(self._client, 'driver', None):
+            try:
+                node = self._client.driver.controller.nodes.get(node_id)
+            except Exception:
+                node = None
+            if node and getattr(node, 'values', None):
+                for v in node.values.values():
+                    try:
+                        item = {
+                            'commandClass': getattr(v, 'command_class', None),
+                            'endpoint': getattr(v, 'endpoint', 0) or 0,
+                            'property': getattr(v, 'property_', None),
+                            'propertyKey': getattr(v, 'property_key', None),
+                            'propertyName': getattr(v, 'property_name', None),
+                        }
+                        items.append(item)
+                        meta_cache[id(item)] = {
+                            'label': getattr(getattr(v, 'metadata', None), 'label', None),
+                            'unit': getattr(getattr(v, 'metadata', None), 'unit', ''),
+                            'writeable': getattr(getattr(v, 'metadata', None), 'writeable', False),
+                            'type': getattr(getattr(v, 'metadata', None), 'type', ''),
+                            'states': getattr(getattr(v, 'metadata', None), 'states', None) or [],
+                        }
+                    except Exception:
+                        continue
+
+        # Preload metadata for candidates with matching CC/endpoint only (limit scope)
         filtered = [i for i in items if getf(i, 'commandClass') == cc and (getf(i, 'endpoint') or 0) == (endpoint or 0)]
         if not filtered:
             filtered = items
         # Limit to reasonable number to avoid heavy calls
         limited = filtered[:30]
-        # Fetch metadata concurrently
+        # Fetch metadata concurrently for those we don't already have
+        to_fetch = [i for i in limited if id(i) not in meta_cache]
         try:
-            metas = await asyncio.gather(*[get_meta(i) for i in limited])
+            metas = await asyncio.gather(*[get_meta(i) for i in to_fetch])
             for idx, md in enumerate(metas):
-                meta_cache[id(limited[idx])] = md
+                meta_cache[id(to_fetch[idx])] = md
         except Exception:
             pass
 
@@ -570,6 +531,30 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     value = bool(value)
         except Exception:
             pass
+        # If address is incomplete, try to resolve before sending
+        if not cc or not prop:
+            resolved = await self._resolve_value_id_async(node_id, cc, endpoint, prop, prop_key, label, value)
+            if resolved:
+                await self._client.async_send_command({
+                    'command': 'node.set_value',
+                    'nodeId': node_id,
+                    'valueId': resolved,
+                    'value': value,
+                })
+                # Persist resolved addressing for future sends
+                try:
+                    def _persist(pk, res):
+                        from simo_zwave.models import NodeValue as NV
+                        NV.objects.filter(pk=pk).update(
+                            command_class=res.get('commandClass'),
+                            endpoint=res.get('endpoint') or 0,
+                            property=res.get('property'),
+                            property_key=res.get('propertyKey'),
+                        )
+                    await asyncio.to_thread(_persist, nv_pk, resolved)
+                except Exception:
+                    pass
+                return
         class _NV: pass
         nv_like = _NV(); nv_like.command_class=cc; nv_like.endpoint=endpoint; nv_like.property=prop; nv_like.property_key=prop_key
         value_id = self._build_value_id(nv_like)
