@@ -186,6 +186,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         elif base_type in ('dimmer',):
             cc = 38  # Multilevel Switch
         else:
+            try:
+                self.logger.info(f"Skip migration for NV pk={nv.pk} base_type={base_type}")
+            except Exception:
+                pass
             return
         # Fetch defined value ids
         try:
@@ -194,11 +198,19 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 'nodeId': nv.node.node_id,
             }))
         except Exception:
+            try:
+                self.logger.error(f"NV pk={nv.pk} get_defined_value_ids failed", exc_info=True)
+            except Exception:
+                pass
             return
         items = resp
         if isinstance(items, dict):
             items = items.get('valueIds') or items.get('result') or []
         if not isinstance(items, list):
+            try:
+                self.logger.info(f"NV pk={nv.pk} has no valueIds list; type={type(items)}")
+            except Exception:
+                pass
             return
         # filter by CC
         def getf(item, key, fallback=None):
@@ -207,6 +219,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             trans = {'commandClass': 'command_class', 'propertyKey': 'property_key', 'propertyName': 'property_name'}
             return getattr(item, trans.get(key, key), fallback)
         cands = [i for i in items if getf(i, 'commandClass') == cc]
+        try:
+            self.logger.info(f"NV pk={nv.pk} valueIds={len(items)} cc={cc} candidates={len(cands)}")
+        except Exception:
+            pass
         # For switches/dimmers prefer 'targetValue'
         cands_target = [i for i in cands if getf(i, 'property') == 'targetValue'] or cands
         # If multiple endpoints, try to match by currentValue against our stored value
@@ -224,6 +240,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         'command': 'node.get_value', 'nodeId': nv.node.node_id, 'valueId': vid
                     }))
                     cur_val = cur.get('value') if isinstance(cur, dict) else None
+                    try:
+                        self.logger.info(f"NV pk={nv.pk} probe ep={vid['endpoint']} currentValue={cur_val} desired={desired}")
+                    except Exception:
+                        pass
                     if base_type == 'switch':
                         if isinstance(cur_val, bool) and isinstance(nv.value, bool) and cur_val == nv.value:
                             chosen = item
@@ -236,10 +256,22 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         except Exception:
                             pass
                 except Exception:
+                    try:
+                        self.logger.error(f"NV pk={nv.pk} get_value failed for ep={vid['endpoint']}", exc_info=True)
+                    except Exception:
+                        pass
                     continue
         if not chosen and cands_target:
             chosen = cands_target[0]
+            try:
+                self.logger.info(f"NV pk={nv.pk} fallback choose ep={getf(chosen,'endpoint') or 0} prop={getf(chosen,'property')}")
+            except Exception:
+                pass
         if not chosen:
+            try:
+                self.logger.info(f"NV pk={nv.pk} no suitable target found; skipping")
+            except Exception:
+                pass
             return
         # Persist mapping
         nv.command_class = getf(chosen, 'commandClass')
@@ -247,6 +279,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         nv.property = 'targetValue'
         nv.property_key = None
         nv.save(update_fields=['command_class', 'endpoint', 'property', 'property_key'])
+        try:
+            self.logger.info(f"Migrated NV pk={nv.pk} to CC={nv.command_class} ep={nv.endpoint} prop=targetValue")
+        except Exception:
+            pass
 
     # --------------- MQTT commands ---------------
     def perform_value_send(self, component, value):
