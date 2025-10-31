@@ -4,6 +4,7 @@ from dal import forward
 from django.utils.translation import gettext_lazy as _
 from simo.core.utils.validators import validate_slaves
 from simo.core.utils.form_widgets import AdminReadonlyFieldWidget, EmptyFieldWidget
+from django.utils.safestring import mark_safe
 from simo.core.forms import BaseGatewayForm, BaseComponentForm, NumericSensorForm
 from simo.core.models import Gateway
 from simo.core.events import GatewayObjectCommand
@@ -16,13 +17,24 @@ from .models import ZwaveNode, NodeValue
 from .widgets import AdminNodeValueValueWidget, AdminNodeValueSelectWidget
 
 
+class _ClickableUrlWidget(forms.Widget):
+    def render(self, name, value, attrs=None, renderer=None):
+        try:
+            from simo.core.utils.helpers import get_self_ip
+            ip = get_self_ip()
+            url = f'http://{ip}:8091'
+            return mark_safe(f'<a href="{url}" target="_blank" rel="noopener">{url}</a>')
+        except Exception:
+            return '—'
+
+
 class ZwaveGatewayForm(BaseGatewayForm):
     expose_ui = forms.BooleanField(
         label=_('Expose Z-Wave JS UI on LAN for 12 hours'), required=False
     )
     ui_url = forms.CharField(
         label=_('Local Z-Wave JS UI URL'), required=False,
-        widget=AdminReadonlyFieldWidget()
+        widget=_ClickableUrlWidget()
     )
     ui_expires = forms.CharField(
         label=_('UI access expires at'), required=False,
@@ -34,10 +46,7 @@ class ZwaveGatewayForm(BaseGatewayForm):
         # fill readonly fields from gateway config
         cfg = self.instance.config or {}
         # UI URL best-effort compute
-        computed = cfg.get('ui_url') or self._compute_ui_url()
-        # Set both field initial and form initial to ensure widget gets a value
-        self.fields['ui_url'].initial = computed
-        self.initial['ui_url'] = computed
+        # Widget renders the link dynamically; no need to set initial
         expires_at = cfg.get('ui_expires_at')
         if expires_at:
             try:

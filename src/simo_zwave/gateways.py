@@ -342,11 +342,15 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             'property_key': '' if prop_key is None else str(prop_key),
         }
         # Try to match existing rows by user-assigned name or label
-        nv = NodeValue.objects.filter(
-            node=zn
-        ).filter(
+        base_qs = NodeValue.objects.filter(node=zn).filter(
             Q(name__iexact=label) | Q(label__iexact=label)
-        ).order_by('-component__isnull').first()
+        )
+        try:
+            nv = base_qs.filter(component__isnull=False).first()
+        except Exception:
+            nv = None
+        if not nv:
+            nv = base_qs.first()
         created = False
         if not nv:
             # Try to reuse a single existing assigned value with matching type/units (best-effort)
