@@ -365,6 +365,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         candidates = [i for i in items if isinstance(i, (dict, object))]
         if not candidates:
             return None
+        # Prefer writable candidates if available
+        writable_candidates = [i for i in candidates if isinstance(meta_cache.get(id(i), {}), dict) and meta_cache.get(id(i), {}).get('writeable')]
+        if writable_candidates:
+            candidates = writable_candidates
         candidates.sort(key=score, reverse=True)
         best = candidates[0]
         vid = {
@@ -380,6 +384,18 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
     async def _set_value(self, node_val: NodeValue, value):
         if not self._client or not self._client.connected:
             raise RuntimeError('Z-Wave JS not connected')
+        # Normalize value for specific CCs
+        try:
+            if node_val.command_class == 38:  # Multilevel Switch
+                if isinstance(value, bool):
+                    value = 99 if value else 0
+                if isinstance(value, (int, float)):
+                    value = max(0, min(int(value), 99))
+            elif node_val.command_class == 37:  # Binary Switch
+                if isinstance(value, (int, float)):
+                    value = bool(value)
+        except Exception:
+            pass
         # Prefer modern API: node.set_value
         value_id = self._build_value_id(node_val)
         try:
