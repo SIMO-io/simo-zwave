@@ -427,6 +427,20 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     except Exception:
                         pass
                     return
+                # As a last resort for switches, call CC API directly
+                try:
+                    if node_val.command_class in (37, 38):
+                        await self._client.async_send_command({
+                            'command': 'endpoint.invoke_cc_api',
+                            'nodeId': node_val.node.node_id,
+                            'endpoint': node_val.endpoint or 0,
+                            'commandClass': node_val.command_class,
+                            'methodName': 'set',
+                            'args': [value],
+                        })
+                        return
+                except Exception:
+                    pass
             # No support for old API; re-raise
             raise
 
