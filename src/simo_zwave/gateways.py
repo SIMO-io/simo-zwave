@@ -98,6 +98,14 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     pass
                 # Import full state from driver model
                 await self._import_driver_state()
+                # Attach event listeners for real-time updates
+                try:
+                    self._attach_event_listeners()
+                except Exception:
+                    try:
+                        self.logger.info("Failed to attach event listeners; falling back to periodic sync only")
+                    except Exception:
+                        pass
                 # Keep task running until closed
                 await listen_task
             except Exception as e:
@@ -116,6 +124,68 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         # Refresh WS URL from config in case it changed
         self._ws_url = self._build_ws_url()
         self._start_ws_thread()
+
+    def _attach_event_listeners(self):
+        if not self._client or not self._client.driver:
+            return
+        controller = self._client.driver.controller
+        for node in list(getattr(controller, 'nodes', {}).values()):
+            try:
+                node.on('value updated', lambda event, n=node: self._on_value_event(event))
+                node.on('value added', lambda event, n=node: self._on_value_event(event))
+            except Exception:
+                continue
+
+    def _on_value_event(self, event):
+        try:
+            node = event.get('node')
+            if not node:
+                return
+            val_obj = event.get('value')
+            args = event.get('args') or {}
+            # Build a val dict similar to _import_driver_state
+            if val_obj is not None:
+                meta = getattr(val_obj, 'metadata', None)
+                val = {
+                    'commandClass': getattr(val_obj, 'command_class', None),
+                    'endpoint': getattr(val_obj, 'endpoint', 0) or 0,
+                    'property': getattr(val_obj, 'property_', None),
+                    'propertyKey': getattr(val_obj, 'property_key', None),
+                    'propertyName': getattr(val_obj, 'property_name', None),
+                    'value': getattr(val_obj, 'value', None),
+                    'metadata': {
+                        'label': getattr(meta, 'label', None),
+                        'unit': getattr(meta, 'unit', ''),
+                        'writeable': getattr(meta, 'writeable', False),
+                        'type': getattr(meta, 'type', ''),
+                        'states': getattr(meta, 'states', None) or [],
+                    },
+                }
+            else:
+                # Fall back to event args structure
+                val = {
+                    'commandClass': args.get('commandClass') or args.get('ccId'),
+                    'endpoint': args.get('endpoint') or 0,
+                    'property': args.get('property'),
+                    'propertyKey': args.get('propertyKey'),
+                    'propertyName': args.get('propertyName'),
+                    'value': args.get('newValue', args.get('value')),
+                    'metadata': args.get('metadata') or {},
+                }
+            state = {
+                'nodeId': node.node_id,
+                'name': getattr(node, 'name', '') or '',
+                'productLabel': getattr(node, 'product_label', '') or '',
+                'values': [val],
+            }
+            import asyncio as _asyncio
+            _asyncio.run_coroutine_threadsafe(self._import_node_async(state), self._loop)
+        except Exception:
+            pass
+
+    async def _import_node_async(self, state: Dict[str, Any]):
+        import asyncio as _asyncio
+        await _asyncio.to_thread(self._import_node_sync, state)
 
     def ufw_expiry_check(self):
         try:
@@ -621,6 +691,21 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 except Exception:
                     pass
                 return
+            # Could not resolve a valid valueId; skip sending to avoid ZW0322
+            try:
+                self.logger.info(f"Skip send: unresolved ValueID for node={node_id} (cc={cc}, ep={endpoint}, prop={prop}, key={prop_key})")
+            except Exception:
+                pass
+            # Try to trigger a values refresh once in a while to aid future resolution
+            try:
+                now = time.time()
+                last = self._last_node_refresh.get(node_id, 0)
+                if now - last > 300:
+                    await self._client.async_send_command({'command': 'node.refresh_values', 'nodeId': node_id})
+                    self._last_node_refresh[node_id] = now
+            except Exception:
+                pass
+            return
         class _NV: pass
         nv_like = _NV(); nv_like.command_class=cc; nv_like.endpoint=endpoint; nv_like.property=prop; nv_like.property_key=prop_key
         value_id = self._build_value_id(nv_like)
