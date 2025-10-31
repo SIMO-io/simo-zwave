@@ -192,10 +192,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             return
         # Map legacy commands to server API
         mapping = {
-            'add_node': {'command': 'begin_inclusion'},
-            'remove_node': {'command': 'begin_exclusion'},
-            'stop_inclusion': {'command': 'stop_inclusion'},
-            'stop_exclusion': {'command': 'stop_exclusion'},
+            'add_node': {'command': 'controller.begin_inclusion'},
+            'remove_node': {'command': 'controller.begin_exclusion'},
+            'stop_inclusion': {'command': 'controller.stop_inclusion'},
+            'stop_exclusion': {'command': 'controller.stop_exclusion'},
         }
         if cmd in mapping:
             await self._client.async_send_command(mapping[cmd])
@@ -214,9 +214,9 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         # Node-scoped ops
         if node_id:
             if cmd == 'remove_failed_node':
-                await self._client.async_send_command({'command': 'remove_failed_node', 'nodeId': node_id})
+                await self._client.async_send_command({'command': 'controller.remove_failed_node', 'nodeId': node_id})
             elif cmd == 'replace_failed_node':
-                await self._client.async_send_command({'command': 'replace_failed_node', 'nodeId': node_id})
+                await self._client.async_send_command({'command': 'controller.replace_failed_node', 'nodeId': node_id})
 
     # --------------- WS helpers ---------------
     def _async_call(self, coro):
@@ -226,13 +226,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         return fut.result(timeout=15)
 
     def _build_ws_url(self) -> str:
-        try:
-            cfg = self.gateway_instance.config or {}
-            host = cfg.get('ws_host') or '127.0.0.1'
-            port = int(cfg.get('ws_port') or 3000)
-            return f'ws://{host}:{port}'
-        except Exception:
-            return 'ws://127.0.0.1:3000'
+        return 'ws://127.0.0.1:3000'
 
     def _build_value_id(self, nv: NodeValue) -> Dict[str, Any]:
         def _coerce(val: Any) -> Any:
@@ -322,46 +316,29 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 'value': value,
             })
         except Exception as e:
-            # Try to resolve to a valid valueId if invalid
+            # Try to resolve to a valid valueId if invalid, then retry once
             msg = str(e)
             if 'Invalid ValueID' in msg or 'ZW0322' in msg or 'zwave_error' in msg:
                 resolved = await self._resolve_value_id_async(node_val)
                 if resolved:
+                    await self._client.async_send_command({
+                        'command': 'node.set_value',
+                        'nodeId': node_val.node.node_id,
+                        'valueId': resolved,
+                        'value': value,
+                    })
+                    # Persist resolved addressing for future sends
                     try:
-                        await self._client.async_send_command({
-                            'command': 'node.set_value',
-                            'nodeId': node_val.node.node_id,
-                            'valueId': resolved,
-                            'value': value,
-                        })
-                        # Persist resolved addressing for future sends
-                        try:
-                            node_val.command_class = resolved.get('commandClass')
-                            node_val.endpoint = resolved.get('endpoint') or 0
-                            node_val.property = resolved.get('property')
-                            node_val.property_key = resolved.get('propertyKey')
-                            node_val.save(update_fields=['command_class', 'endpoint', 'property', 'property_key'])
-                        except Exception:
-                            pass
-                        return
+                        node_val.command_class = resolved.get('commandClass')
+                        node_val.endpoint = resolved.get('endpoint') or 0
+                        node_val.property = resolved.get('property')
+                        node_val.property_key = resolved.get('propertyKey')
+                        node_val.save(update_fields=['command_class', 'endpoint', 'property', 'property_key'])
                     except Exception:
                         pass
-            # Fallback for older servers
-            payload = {
-                'command': 'set_value',
-                'nodeId': node_val.node.node_id,
-                'commandClass': value_id['commandClass'],
-                'endpoint': value_id['endpoint'],
-                'property': value_id['property'],
-                'value': value,
-            }
-            if 'propertyKey' in value_id:
-                payload['propertyKey'] = value_id['propertyKey']
-            try:
-                await self._client.async_send_command(payload)
-            except Exception:
-                # Give up silently; error already logged by caller
-                raise
+                    return
+            # No support for old API; re-raise
+            raise
 
     async def _import_driver_state(self):
         if not self._client or not self._client.driver:
