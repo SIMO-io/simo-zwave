@@ -50,7 +50,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         try:
             self.logger = get_gw_logger(self.gateway_instance.id)
         except Exception:
-            pass
+            logging.exception("Failed to initialize gateway logger")
         # Start WS thread immediately to avoid early send attempts failing
         self._start_ws_thread()
         # Start MQTT command listener (BaseObjectCommandsGatewayHandler)
@@ -138,6 +138,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 node.on('sleep', lambda event, n=node: self._on_node_status_event(event))
                 node.on('wake up', lambda event, n=node: self._on_node_status_event(event))
             except Exception:
+                self.logger.error(f"Failed to attach listeners for node {getattr(node,'node_id',None)}", exc_info=True)
                 continue
 
     def _on_value_event(self, event):
@@ -182,11 +183,12 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 'productLabel': getattr(node, 'product_label', '') or '',
                 'status': getattr(node, 'status', None),
                 'values': [val],
+                'partial': True,
             }
             import asyncio as _asyncio
             _asyncio.run_coroutine_threadsafe(self._import_node_async(state), self._loop)
         except Exception:
-            pass
+            self.logger.error("Unhandled exception in value event", exc_info=True)
 
     def _on_node_status_event(self, event):
         try:
@@ -215,11 +217,14 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     try:
                         comp.controller._receive_from_device(comp.value, is_alive=is_alive)
                     except Exception:
-                        continue
+                        self.logger.error(
+                            f"Failed to propagate availability to component {getattr(comp,'id',None)} for node {zn.node_id}",
+                            exc_info=True,
+                        )
             except Exception:
-                pass
+                self.logger.error("Failed availability propagation sweep", exc_info=True)
         except Exception:
-            pass
+            self.logger.error("Unhandled exception in node status event", exc_info=True)
 
     async def _import_node_async(self, state: Dict[str, Any]):
         import asyncio as _asyncio
@@ -241,7 +246,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 self.gateway_instance.save(update_fields=['config'])
                 self.logger.info("Closed temporary Z-Wave UI access (expired)")
         except Exception:
-            pass
+            self.logger.error("UFW expiry check failed", exc_info=True)
 
     def sync_values(self):
         # Periodically import current driver state into DB so values remain fresh
@@ -256,7 +261,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     pass
                 self._async_call(self._import_driver_state())
         except Exception:
-            pass
+            self.logger.error("Periodic sync failed", exc_info=True)
 
     # --- Legacy bindings migration (one-time) ---
     _migrating = False
@@ -288,9 +293,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     try:
                         self.logger.info(f"Migrating NV pk={nv.pk} comp={nv.component_id} base_type={nv.component.base_type}")
                     except Exception:
-                        pass
+                        self.logger.error("Failed to log migration start", exc_info=True)
                     self._migrate_one_legacy(nv)
                 except Exception:
+                    self.logger.error(f"Legacy migration failed for NV pk={nv.pk}", exc_info=True)
                     continue
         finally:
             self._migrating = False
@@ -370,17 +376,17 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         # If node is marked dead, skip the send and reflect availability
         try:
             if hasattr(node_val, 'node') and node_val.node and node_val.node.alive is False:
-                try:
-                    self.logger.info(f"Node {node_val.node.node_id} is dead; skipping send for comp={component.id}")
-                except Exception:
-                    pass
+                self.logger.info(f"Node {node_val.node.node_id} is dead; skipping send for comp={component.id}")
                 try:
                     component.controller._receive_from_device(component.value, is_alive=False)
                 except Exception:
-                    pass
+                    self.logger.error(
+                        f"Failed to mark component {component.id} unavailable for dead node {node_val.node.node_id}",
+                        exc_info=True,
+                    )
                 return
         except Exception:
-            pass
+            self.logger.error("Availability precheck failed", exc_info=True)
         try:
             try:
                 self.logger.info(f"Send comp={component.id} '{component.name}' nv={node_val.pk} raw={value}")
@@ -537,6 +543,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             except Exception:
                 pass
         except Exception:
+            self.logger.error(f"Resolver: get_defined_value_ids failed for node {node_id}", exc_info=True)
             resp = None
 
         items = resp
@@ -578,6 +585,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         return md
                 return {}
             except Exception:
+                self.logger.error(f"Resolver: get_value_metadata failed for node {node_id}", exc_info=True)
                 return {}
 
         # Determine expected type
@@ -632,7 +640,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             for idx, md in enumerate(metas):
                 meta_cache[id(to_fetch[idx])] = md
         except Exception:
-            pass
+            self.logger.error("Resolver: metadata prefetch failed", exc_info=True)
 
         def score(item) -> int:
             s = 0
@@ -756,7 +764,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     await self._client.async_send_command({'command': 'node.refresh_values', 'nodeId': node_id})
                     self._last_node_refresh[node_id] = now
             except Exception:
-                pass
+                self.logger.error(f"Failed to refresh node {node_id} values", exc_info=True)
             return
         class _NV: pass
         nv_like = _NV(); nv_like.command_class=cc; nv_like.endpoint=endpoint; nv_like.property=prop; nv_like.property_key=prop_key
@@ -903,15 +911,16 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         continue
         except Exception:
             pass
-        # Log node import summary only when value count changes
-        try:
-            vcount = len(node_state.get('values') or [])
-            key = f"node:{node_id}:vcount"
-            if self._last_state.get(key) != vcount:
-                self._last_state[key] = vcount
-                self.logger.info(f"Import node {node_id}: values={vcount}")
-        except Exception:
-            pass
+        # Log node import summary only when value count changes, and only on full imports
+        if not node_state.get('partial'):
+            try:
+                vcount = len(node_state.get('values') or [])
+                key = f"node:{node_id}:vcount"
+                if self._last_state.get(key) != vcount:
+                    self._last_state[key] = vcount
+                    self.logger.info(f"Import node {node_id}: values={vcount}")
+            except Exception:
+                pass
         values = node_state.get('values', {})
         if isinstance(values, dict):
             vals_iter = values.values()
@@ -1023,7 +1032,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         except Exception:
             pass
         # Battery level shortcut
-        if cc == 0x80 and units == '%' and current is not None:
+        if cc == 0x80 and current is not None:
             try:
                 zn.battery_level = current
                 zn.save(update_fields=['battery_level'])
@@ -1041,17 +1050,43 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     try:
                         comp.controller._receive_from_device(comp.value, is_alive=zn.alive, battery_level=current)
                     except Exception:
-                        continue
+                        self.logger.error(
+                            f"Failed to propagate battery to component {getattr(comp,'id',None)} for node {zn.node_id} level={current}",
+                            exc_info=True,
+                        )
             except Exception:
-                pass
-        # Push to component if linked
+                self.logger.error("Battery propagation sweep failed", exc_info=True)
+        # Push to component if linked. For switches/dimmers, prefer targetValue-bound NV
+        if cc in (37, 38) and str(prop) == 'currentValue':
+            try:
+                target_nv = NodeValue.objects.filter(
+                    node=zn, command_class=cc, endpoint=endpoint, property='targetValue'
+                ).filter(component__isnull=False).first()
+            except Exception:
+                target_nv = None
+            if target_nv and target_nv.component:
+                try:
+                    # keep component in sync with current value
+                    if target_nv.value != current:
+                        target_nv.value = current
+                        target_nv.value_new = current
+                        target_nv.save(update_fields=['value', 'value_new'])
+                    target_nv.component.controller._receive_from_device(current, is_alive=zn.alive)
+                except Exception:
+                    self.logger.error(
+                        f"Failed to set component value (current->target sync) comp={getattr(target_nv.component,'id',None)} node={zn.node_id} cc={cc} ep={endpoint} prop=currentValue val={current}",
+                        exc_info=True,
+                    )
+                return
         if nv.component:
             try:
                 if nv.value is not None:
                     nv.component.controller._receive_from_device(nv.value, is_alive=zn.alive)
             except Exception:
-                # Lower verbosity; skip noisy stack traces here
-                self.logger.info("Failed to set component value (ignored)")
+                self.logger.error(
+                    f"Failed to set component value comp={getattr(nv.component,'id',None)} node={zn.node_id} cc={cc} ep={endpoint} prop={prop} key={prop_key} val={nv.value}",
+                    exc_info=True,
+                )
 
     # With client.listen(), the library updates the driver model internally.
     # We keep DB in sync via periodic full imports or future event hooks.
