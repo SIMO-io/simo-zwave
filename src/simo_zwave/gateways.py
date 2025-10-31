@@ -234,17 +234,36 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         except Exception:
             return 'ws://127.0.0.1:3000'
 
+    def _build_value_id(self, nv: NodeValue) -> Dict[str, Any]:
+        def _coerce(val: Any) -> Any:
+            if isinstance(val, str) and val.isdigit():
+                try:
+                    return int(val)
+                except Exception:
+                    return val
+            return val
+        prop = _coerce(nv.property)
+        # For Switch command classes, writes go to targetValue
+        try:
+            if nv.command_class in (37, 38) and prop == 'currentValue':
+                prop = 'targetValue'
+        except Exception:
+            pass
+        vid: Dict[str, Any] = {
+            'commandClass': nv.command_class,
+            'endpoint': nv.endpoint or 0,
+            'property': prop,
+        }
+        pk = nv.property_key
+        if pk not in (None, ''):
+            vid['propertyKey'] = _coerce(pk)
+        return vid
+
     async def _set_value(self, node_val: NodeValue, value):
         if not self._client or not self._client.connected:
             raise RuntimeError('Z-Wave JS not connected')
         # Prefer modern API: node.set_value
-        value_id = {
-            'commandClass': node_val.command_class,
-            'endpoint': node_val.endpoint or 0,
-            'property': node_val.property,
-        }
-        if node_val.property_key not in (None, ''):
-            value_id['propertyKey'] = node_val.property_key
+        value_id = self._build_value_id(node_val)
         try:
             await self._client.async_send_command({
                 'command': 'node.set_value',
@@ -257,13 +276,13 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             payload = {
                 'command': 'set_value',
                 'nodeId': node_val.node.node_id,
-                'commandClass': node_val.command_class,
-                'endpoint': node_val.endpoint or 0,
-                'property': node_val.property,
+                'commandClass': value_id['commandClass'],
+                'endpoint': value_id['endpoint'],
+                'property': value_id['property'],
                 'value': value,
             }
-            if node_val.property_key not in (None, ''):
-                payload['propertyKey'] = node_val.property_key
+            if 'propertyKey' in value_id:
+                payload['propertyKey'] = value_id['propertyKey']
             await self._client.async_send_command(payload)
 
     async def _import_driver_state(self):
