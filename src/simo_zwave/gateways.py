@@ -40,6 +40,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         self._thread: Optional[threading.Thread] = None
         self._connected = False
         self._last_state: Dict[str, Any] = {}
+        self._last_node_refresh: Dict[int, float] = {}
 
     # --------------- Lifecycle ---------------
     def run(self, exit):
@@ -216,6 +217,17 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 self.logger.info(f"NV pk={nv.pk} no suitable target found; skipping (base_type={base_type})")
             except Exception:
                 pass
+            # For switches/dimmers where we failed to resolve, ask node to refresh its values (throttled)
+            if cc in (37, 38):
+                now = time.time()
+                last = self._last_node_refresh.get(nv.node.node_id, 0)
+                if now - last > 300:
+                    try:
+                        self._async_call(self._client.async_send_command({'command': 'node.refresh_values', 'nodeId': nv.node.node_id}))
+                        self._last_node_refresh[nv.node.node_id] = now
+                        self.logger.info(f"Requested node {nv.node.node_id} values refresh for migration")
+                    except Exception:
+                        pass
             return
         # Persist mapping
         nv.command_class = resolved.get('commandClass')
@@ -503,6 +515,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 s += 3
             prop_i = getf(item, 'property')
             pname = getf(item, 'propertyName')
+            # Switch/dimmer preference
             if cc in (37, 38) and prop_i == 'targetValue':
                 s += 5
             if (prop is not None and prop_i == prop) or (prop is not None and pname == prop):
@@ -511,13 +524,30 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 s += 1
             if pname and label and str(pname).lower() == str(label).lower():
                 s += 1
-            # writable preference
+            # writable/read-only preference: prefer writeable only for switches/dimmers
             meta = meta_cache.get(id(item), {})
-            if isinstance(meta, dict) and meta.get('writeable'):
-                s += 1
+            is_writeable = isinstance(meta, dict) and meta.get('writeable')
+            if cc in (37, 38):
+                if is_writeable:
+                    s += 2
+            else:
+                if is_writeable:
+                    s -= 2
+                else:
+                    s += 2
             # expected type preference
             if expected_type and isinstance(meta, dict) and meta.get('type') == expected_type:
                 s += 1
+            # penalize clearly wrong Basic helpers for sensors
+            if cc not in (37, 38) and getf(item, 'commandClass') == 32:
+                # 'Basic' should not be preferred for sensors
+                s -= 3
+            # prefer currentValue for reads in non-switch contexts
+            if cc not in (37, 38) and prop_i == 'currentValue':
+                s += 2
+            # de-prioritize 'restorePrevious'
+            if str(prop_i) == 'restorePrevious':
+                s -= 4
             return s
 
         candidates = [i for i in items if isinstance(i, (dict, object))]
@@ -590,24 +620,34 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         nv_like = _NV(); nv_like.command_class=cc; nv_like.endpoint=endpoint; nv_like.property=prop; nv_like.property_key=prop_key
         value_id = self._build_value_id(nv_like)
         try:
-            await self._client.async_send_command({
+            self.logger.info(f"Set start node={node_id} cc={cc} ep={endpoint} prop={prop} key={prop_key} value={value}")
+            res = await self._client.async_send_command({
                 'command': 'node.set_value',
                 'nodeId': node_id,
                 'valueId': value_id,
                 'value': value,
             })
+            try:
+                self.logger.info(f"Set result node={node_id}: {res}")
+            except Exception:
+                pass
         except Exception as e:
             # Try to resolve to a valid valueId if invalid, then retry once
             msg = str(e)
             if 'Invalid ValueID' in msg or 'ZW0322' in msg or 'zwave_error' in msg:
                 resolved = await self._resolve_value_id_async(node_id, cc, endpoint, prop, prop_key, label, value)
                 if resolved:
-                    await self._client.async_send_command({
+                    self.logger.info(f"Retry with resolved valueId node={node_id} {resolved}")
+                    res2 = await self._client.async_send_command({
                         'command': 'node.set_value',
                         'nodeId': node_id,
                         'valueId': resolved,
                         'value': value,
                     })
+                    try:
+                        self.logger.info(f"Set resolved result node={node_id}: {res2}")
+                    except Exception:
+                        pass
                     # Persist resolved addressing for future sends
                     try:
                         def _persist(pk, res):
@@ -625,6 +665,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 # As a last resort for switches, call CC API directly
                 try:
                     if cc in (37, 38):
+                        self.logger.info(f"Fallback invoke_cc_api set node={node_id} cc={cc} ep={endpoint} value={value}")
                         await self._client.async_send_command({
                             'command': 'endpoint.invoke_cc_api',
                             'nodeId': node_id,
@@ -697,6 +738,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             zn.name = name
         zn.alive = True
         zn.save()
+        try:
+            self.logger.info(f"Import node {node_id}: values={len(node_state.get('values') or [])}")
+        except Exception:
+            pass
         values = node_state.get('values', {})
         if isinstance(values, dict):
             vals_iter = values.values()
@@ -731,12 +776,26 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             'property': str(prop),
             'property_key': '' if prop_key is None else str(prop_key),
         }
-        # Try to match existing rows by user-assigned name or label
-        base_qs = NodeValue.objects.filter(node=zn).filter(
-            Q(name__iexact=label) | Q(label__iexact=label)
+        # Try to match existing rows by addressing first
+        addr_qs = NodeValue.objects.filter(
+            node=zn,
+            command_class=cc,
+            endpoint=endpoint,
+            property=str(prop),
+            property_key='' if prop_key is None else str(prop_key),
         )
+        nv = addr_qs.filter(component__isnull=False).first() or addr_qs.first()
+        # If we still didn't find and this is a switch/dimmer currentValue, try to map
+        # to an existing targetValue entry (common binding from OZW days)
+        if not nv and cc in (37, 38) and str(prop) == 'currentValue':
+            alt_qs = NodeValue.objects.filter(
+                node=zn, command_class=cc, endpoint=endpoint, property='targetValue'
+            )
+            nv = alt_qs.filter(component__isnull=False).first() or alt_qs.first()
+        # Fallback to label/name matching
+        base_qs = NodeValue.objects.filter(node=zn).filter(Q(name__iexact=label) | Q(label__iexact=label))
         try:
-            nv = base_qs.filter(component__isnull=False).first()
+            nv = nv or base_qs.filter(component__isnull=False).first()
         except Exception:
             nv = None
         if not nv:
@@ -760,6 +819,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             for k, v in data.items():
                 setattr(nv, k, v)
         nv.save()
+        try:
+            self.logger.info(f"Import map node={zn.node_id} '{label}' -> NV pk={nv.pk} cc={cc} ep={endpoint} prop={prop} key={prop_key} created={created}")
+        except Exception:
+            pass
         # Battery level shortcut
         if cc == 0x80 and units == '%':
             zn.battery_level = current
