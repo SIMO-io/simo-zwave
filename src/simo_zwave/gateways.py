@@ -259,6 +259,56 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             vid['propertyKey'] = _coerce(pk)
         return vid
 
+    async def _resolve_value_id_async(self, nv: NodeValue) -> Optional[Dict[str, Any]]:
+        """Ask server for defined value IDs and pick the best writable match.
+
+        Strategy:
+        - Prefer same commandClass and endpoint.
+        - If CC is Binary/Multilevel Switch (37/38), prefer property 'targetValue'.
+        - Otherwise, try matching our current property/propertyKey or propertyName == label.
+        Returns a valueId dict or None.
+        """
+        try:
+            resp = await self._client.async_send_command({
+                'command': 'node.get_defined_value_ids',
+                'nodeId': nv.node.node_id,
+            })
+            items = resp or []
+        except Exception:
+            return None
+
+        def score(item: Dict[str, Any]) -> int:
+            s = 0
+            if item.get('commandClass') == nv.command_class:
+                s += 5
+            if (item.get('endpoint') or 0) == (nv.endpoint or 0):
+                s += 3
+            prop = item.get('property')
+            pname = item.get('propertyName')
+            # Switches: prefer targetValue
+            if nv.command_class in (37, 38) and prop == 'targetValue':
+                s += 5
+            if prop == nv.property or pname == nv.property:
+                s += 2
+            if nv.property_key is not None and nv.property_key != '' and item.get('propertyKey') == nv.property_key:
+                s += 1
+            if pname and nv.label and str(pname).lower() == str(nv.label).lower():
+                s += 1
+            return s
+
+        if not items:
+            return None
+        items = sorted(items, key=score, reverse=True)
+        best = items[0]
+        vid = {
+            'commandClass': best.get('commandClass'),
+            'endpoint': best.get('endpoint') or 0,
+            'property': best.get('property'),
+        }
+        if best.get('propertyKey') is not None:
+            vid['propertyKey'] = best.get('propertyKey')
+        return vid
+
     async def _set_value(self, node_val: NodeValue, value):
         if not self._client or not self._client.connected:
             raise RuntimeError('Z-Wave JS not connected')
@@ -271,7 +321,31 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 'valueId': value_id,
                 'value': value,
             })
-        except Exception:
+        except Exception as e:
+            # Try to resolve to a valid valueId if invalid
+            msg = str(e)
+            if 'Invalid ValueID' in msg or 'ZW0322' in msg or 'zwave_error' in msg:
+                resolved = await self._resolve_value_id_async(node_val)
+                if resolved:
+                    try:
+                        await self._client.async_send_command({
+                            'command': 'node.set_value',
+                            'nodeId': node_val.node.node_id,
+                            'valueId': resolved,
+                            'value': value,
+                        })
+                        # Persist resolved addressing for future sends
+                        try:
+                            node_val.command_class = resolved.get('commandClass')
+                            node_val.endpoint = resolved.get('endpoint') or 0
+                            node_val.property = resolved.get('property')
+                            node_val.property_key = resolved.get('propertyKey')
+                            node_val.save(update_fields=['command_class', 'endpoint', 'property', 'property_key'])
+                        except Exception:
+                            pass
+                        return
+                    except Exception:
+                        pass
             # Fallback for older servers
             payload = {
                 'command': 'set_value',
@@ -283,7 +357,11 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             }
             if 'propertyKey' in value_id:
                 payload['propertyKey'] = value_id['propertyKey']
-            await self._client.async_send_command(payload)
+            try:
+                await self._client.async_send_command(payload)
+            except Exception:
+                # Give up silently; error already logged by caller
+                raise
 
     async def _import_driver_state(self):
         if not self._client or not self._client.driver:
