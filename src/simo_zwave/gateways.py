@@ -133,6 +133,9 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             try:
                 node.on('value updated', lambda event, n=node: self._on_value_event(event))
                 node.on('value added', lambda event, n=node: self._on_value_event(event))
+                node.on('value notification', lambda event, n=node: self._on_value_event(event))
+                node.on('notification', lambda event, n=node: self._on_value_event(event))
+                node.on('metadata updated', lambda event, n=node: self._on_value_event(event))
                 node.on('dead', lambda event, n=node: self._on_node_status_event(event))
                 node.on('alive', lambda event, n=node: self._on_node_status_event(event))
                 node.on('sleep', lambda event, n=node: self._on_node_status_event(event))
@@ -146,7 +149,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             node = event.get('node')
             if not node:
                 return
-            val_obj = event.get('value')
+            val_obj = event.get('value') or event.get('value_notification')
             args = event.get('args') or {}
             # Build a val dict similar to _import_driver_state
             if val_obj is not None:
@@ -221,6 +224,14 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                             f"Failed to propagate availability to component {getattr(comp,'id',None)} for node {zn.node_id}",
                             exc_info=True,
                         )
+                        try:
+                            comp.alive = is_alive
+                            comp.save(update_fields=['alive'])
+                        except Exception:
+                            self.logger.error(
+                                f"Failed to persist availability directly for component {getattr(comp,'id',None)}",
+                                exc_info=True,
+                            )
             except Exception:
                 self.logger.error("Failed availability propagation sweep", exc_info=True)
         except Exception:
@@ -782,6 +793,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 self.logger.info(f"Set result node={node_id}: {res}")
             except Exception:
                 pass
+            # No post-send verification here; rely purely on events
         except Exception as e:
             # Try to resolve to a valid valueId if invalid, then retry once
             msg = str(e)
@@ -908,7 +920,19 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     try:
                         comp.controller._receive_from_device(comp.value, is_alive=zn.alive)
                     except Exception:
-                        continue
+                        self.logger.error(
+                            f"Failed to propagate availability (import) to component {getattr(comp,'id',None)} for node {zn.node_id}",
+                            exc_info=True,
+                        )
+                        try:
+                            # Hard-set alive as last resort
+                            comp.alive = zn.alive
+                            comp.save(update_fields=['alive'])
+                        except Exception:
+                            self.logger.error(
+                                f"Failed to persist availability directly for component {getattr(comp,'id',None)}",
+                                exc_info=True,
+                            )
         except Exception:
             pass
         # Log node import summary only when value count changes, and only on full imports
