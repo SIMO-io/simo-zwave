@@ -344,9 +344,29 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             resolved = None
         if not resolved:
             try:
-                self.logger.info(f"NV pk={nv.pk} no suitable target found; skipping (base_type={base_type})")
+                dbg = {}
+                try:
+                    if self._client and self._client.driver:
+                        node = self._client.driver.controller.nodes.get(nv.node.node_id)
+                        if node and getattr(node, 'values', None):
+                            vals = list(node.values.values())
+                            dbg['total_values'] = len(vals)
+                            dbg['endpoints'] = sorted({getattr(v, 'endpoint', 0) or 0 for v in vals})
+                            dbg['ccs'] = sorted({getattr(v, 'command_class', None) for v in vals})
+                            desired_cc = 37 if base_type in ('switch','lock','blinds','gate','rgbw-light') else 38 if base_type == 'dimmer' else None
+                            if desired_cc is not None:
+                                props = [str(getattr(v, 'property_', None)) for v in vals if getattr(v, 'command_class', None) == desired_cc]
+                                eps = sorted({getattr(v, 'endpoint', 0) or 0 for v in vals if getattr(v, 'command_class', None) == desired_cc})
+                                dbg['desired_cc'] = desired_cc
+                                dbg['desired_cc_endpoints'] = eps
+                                dbg['desired_cc_props_sample'] = props[:8]
+                except Exception:
+                    self.logger.error("Failed building migration debug info", exc_info=True)
+                self.logger.info(
+                    f"NV pk={nv.pk} no suitable target found; skipping (base_type={base_type}) node={nv.node.node_id} comp={nv.component_id} dbg={dbg}"
+                )
             except Exception:
-                pass
+                self.logger.error("Failed to log migration debug info", exc_info=True)
             # For switches/dimmers where we failed to resolve, ask node to refresh its values (throttled)
             if cc in (37, 38):
                 now = time.time()
@@ -393,6 +413,16 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 except Exception:
                     self.logger.error(
                         f"Failed to mark component {component.id} unavailable for dead node {node_val.node.node_id}",
+                        exc_info=True,
+                    )
+                # Persist availability regardless to ensure UI reflects reality
+                try:
+                    if component.alive:
+                        component.alive = False
+                        component.save(update_fields=['alive'])
+                except Exception:
+                    self.logger.error(
+                        f"Failed to persist component {component.id} alive=False",
                         exc_info=True,
                     )
                 return
