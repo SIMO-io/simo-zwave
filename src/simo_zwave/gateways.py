@@ -180,6 +180,12 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     'value': args.get('newValue', args.get('value')),
                     'metadata': args.get('metadata') or {},
                 }
+            try:
+                self.logger.info(
+                    f"Event value node={node.node_id} cc={val.get('commandClass')} ep={val.get('endpoint')} prop={val.get('property')} key={val.get('propertyKey')} val={val.get('value')}"
+                )
+            except Exception:
+                pass
             state = {
                 'nodeId': node.node_id,
                 'name': getattr(node, 'name', '') or '',
@@ -1110,7 +1116,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         )
             except Exception:
                 self.logger.error("Battery propagation sweep failed", exc_info=True)
-        # Push to component if linked. For switches/dimmers, prefer targetValue-bound NV
+        # Push to component if linked. For switches/dimmers, prefer targetValue/currentValue-bound NV
         if cc in (37, 38) and str(prop) == 'currentValue':
             try:
                 # First try exact endpoint
@@ -1140,6 +1146,31 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 except Exception:
                     self.logger.error(
                         f"Failed to set component value (current->target sync) comp={getattr(target_nv.component,'id',None)} node={zn.node_id} cc={cc} ep={endpoint} prop=currentValue val={current}",
+                        exc_info=True,
+                    )
+                return
+        if cc in (37, 38) and str(prop) == 'targetValue':
+            try:
+                # Symmetric: update a bound currentValue if present
+                curr_nv = NodeValue.objects.filter(
+                    node=zn, command_class=cc, endpoint=endpoint, property='currentValue', component__isnull=False
+                ).first()
+                if not curr_nv and endpoint not in (0, None):
+                    curr_nv = NodeValue.objects.filter(
+                        node=zn, command_class=cc, endpoint=0, property='currentValue', component__isnull=False
+                    ).first()
+            except Exception:
+                curr_nv = None
+            if curr_nv and curr_nv.component:
+                try:
+                    if curr_nv.value != current:
+                        curr_nv.value = current
+                        curr_nv.value_new = current
+                        curr_nv.save(update_fields=['value', 'value_new'])
+                    curr_nv.component.controller._receive_from_device(current, is_alive=zn.alive)
+                except Exception:
+                    self.logger.error(
+                        f"Failed to set component value (target->current sync) comp={getattr(curr_nv.component,'id',None)} node={zn.node_id} cc={cc} ep={endpoint} prop=targetValue val={current}",
                         exc_info=True,
                     )
                 return
