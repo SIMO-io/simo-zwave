@@ -1083,9 +1083,20 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         # Push to component if linked. For switches/dimmers, prefer targetValue-bound NV
         if cc in (37, 38) and str(prop) == 'currentValue':
             try:
+                # First try exact endpoint
                 target_nv = NodeValue.objects.filter(
-                    node=zn, command_class=cc, endpoint=endpoint, property='targetValue'
-                ).filter(component__isnull=False).first()
+                    node=zn, command_class=cc, endpoint=endpoint, property='targetValue', component__isnull=False
+                ).first()
+                # Fallback: try root endpoint 0 if exact not present
+                if not target_nv and endpoint not in (0, None):
+                    target_nv = NodeValue.objects.filter(
+                        node=zn, command_class=cc, endpoint=0, property='targetValue', component__isnull=False
+                    ).first()
+                # Fallback: any endpoint with a bound targetValue for this CC
+                if not target_nv:
+                    target_nv = NodeValue.objects.filter(
+                        node=zn, command_class=cc, property='targetValue', component__isnull=False
+                    ).order_by('endpoint').first()
             except Exception:
                 target_nv = None
             if target_nv and target_nv.component:
