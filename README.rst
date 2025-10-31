@@ -1,155 +1,119 @@
 =================================
-Z‑Wave (OpenZWave) integration for SIMO.io
+Z‑Wave JS integration for SIMO.io
 =================================
 
-Local Z‑Wave control on a SIMO.io hub using OpenZWave. This app adds a
-``Zwave`` gateway and Z‑Wave‑aware controllers so you can include/exclude
-nodes from Django Admin and map device values to SIMO.io components
-switches, dimmers, sensors, RGBW lights — for a clean, app‑native UI.
+Local Z‑Wave control on a SIMO.io hub using Z‑Wave JS (via Z‑Wave JS UI). This app adds a
+``Z‑Wave JS`` gateway and Z‑Wave‑aware controllers so you can include/exclude devices from Django Admin
+and map device values to SIMO.io components (switches, dimmers, sensors, RGBW lights, buttons) for a clean, app‑native UI.
 
 What you get (at a glance)
 --------------------------
 
-* Gateway type: ``Zwave`` (auto‑created with defaults after restart).
+* Gateway type: ``Z‑Wave JS`` (auto‑created after restart).
+* Uses the Z‑Wave JS Server WebSocket API (loopback only) — no MQTT required.
+* Optional local Z‑Wave JS UI access on port 8091, LAN‑only, time‑boxed for 12h (toggle on the gateway form).
 * Device management in Django Admin:
-  - Include nodes (“Add”) and exclude nodes (“Remove nodes”) with live
-    progress; pending commands auto‑cancel after timeout.
-  - Per‑node values (read/write) listed inline; name values you intend to
-    map to components; change values where writable.
-  - Actions: kill node, request network update, send node information,
-    check if node failed.
-* Component types (select per value):
-  - ``Switch`` and ``Binary sensor`` (Bool/Button values → on/off).
-  - ``Dimmer`` (numeric values with min/max mapping to 0–100).
-  - ``Numeric sensor`` (temperatures, power, etc.; preserves units).
-  - ``RGBW light`` (basic color control; optional white channel).
-* OpenZWave devices library updater (Admin button), local MQTT bridge,
-  and periodic node health updates.
+  - Start inclusion (“Add”) and exclusion (“Remove nodes”) with live updates.
+  - Per‑node values (read/write) listed inline; pick values for components.
+  - Actions: remove/replace failed node.
+* Component types:
+  - ``Switch`` / ``Binary sensor``
+  - ``Dimmer`` (maps device range to 0–100)
+  - ``Numeric sensor`` (temperature, power, etc.)
+  - ``RGBW light``
+  - ``Button`` (maps Central Scene: click, double/triple/quad/quintuple‑click, hold, up)
 
 Requirements
 ------------
 
-* SIMO.io core ``>= 3.1.7`` (installed on your hub).
-* Python ``>= 3.12``.
-* USB Z‑Wave controller attached to the hub (e.g., ``/dev/ttyACM0`` or
-  ``/dev/ttyUSB0``) with appropriate OS permissions.
-* The hub can create and write to its OpenZWave config paths
-  (created automatically on first run).
-* A Z‑Wave network key is generated automatically and stored in the hub’s
-  dynamic settings; keep it stable unless you intentionally re‑key devices.
+* SIMO.io hub (Python >= 3.12).
+* USB Z‑Wave controller attached to the hub (use ``/dev/serial/by-id/...`` with a short USB extension).
+* Z‑Wave JS UI installed on the hub and configured to run the Z‑Wave JS driver and WS server.
 
-Install on a SIMO.io hub
+Install Z‑Wave JS UI (Snap)
+---------------------------
+
+.. code-block:: bash
+
+   sudo snap install zwave-js-ui
+   sudo snap connect zwave-js-ui:raw-usb
+   sudo snap connect zwave-js-ui:hardware-observe
+
+Open the UI at http://localhost:8091 on the hub (or use the 12h exposure toggle below) and set:
+
+* Settings → Z‑Wave → Serial Port: select ``/dev/serial/by-id/...`` for your stick.
+* Settings → Z‑Wave → Security Keys: define S0 and S2 keys; keep a backup.
+* Settings → Home Assistant → WS Server: enable, Host ``127.0.0.1``, Port ``3000`` (loopback only).
+* Settings → MQTT Gateway: disable (not required by SIMO).
+
+Install this integration
 ------------------------
 
-1. SSH to your hub and activate the hub’s Python environment
-   (for example ``workon simo-hub``).
+1) Install package on the hub
 
-   .. code-block:: bash
+.. code-block:: bash
 
-      workon simo-hub
+   workon simo-hub
+   pip install simo-zwave
 
-2. Install the package.
+2) Enable the app in ``/etc/SIMO/settings.py``
 
-   .. code-block:: bash
+.. code-block:: python
 
-      pip install simo-zwave
+   from simo.settings import *  # platform defaults
+   INSTALLED_APPS += ['simo_zwave']
 
-3. Enable the app in Django settings (``/etc/SIMO/settings.py``).
+3) Apply migrations and restart services
 
-   .. code-block:: python
+.. code-block:: bash
 
-      # /etc/SIMO/settings.py
-      from simo.settings import *  # keep platform defaults
+   cd /etc/SIMO/hub
+   python manage.py migrate
+   supervisorctl restart all
 
-      INSTALLED_APPS += [
-          'simo_zwave',
-      ]
+Gateway & Local UI access
+-------------------------
 
-4. Apply migrations from this app.
+After restart, a ``Z‑Wave JS`` gateway is auto‑created. Open it in Django Admin:
 
-   .. code-block:: bash
+* “Expose Z‑Wave JS UI on LAN for 12 hours” — toggling ON opens UFW for port 8091 to RFC1918 ranges,
+  shows the local URL (e.g., ``http://<hub-ip>:8091``) and an expiry timestamp, and auto‑closes after 12h.
+  Default UI credentials are ``admin / zwave`` (change them in Z‑Wave JS UI).
+* The Z‑Wave JS WebSocket API stays bound to ``127.0.0.1:3000`` and is never exposed.
 
-      cd /etc/SIMO/hub
+Inclusion / Exclusion (Django Admin)
+------------------------------------
 
-      python manage.py migrate
+* Include: Django Admin → “Zwave nodes” → “Add”. Put the device in inclusion mode; new nodes appear live.
+* Exclude: Django Admin → “Zwave nodes” → “Remove nodes”. Put the device in exclusion mode; removed nodes are listed.
+* Failed nodes: Use actions on the node list to remove/replace failed devices.
 
-5. Restart SIMO services so the new app and gateway type load.
+Create components (SIMO app / Admin)
+------------------------------------
 
-   .. code-block:: bash
+Create components the usual way and select the ``Z‑Wave JS`` gateway:
 
-      supervisorctl restart all
+* Choose the controller type (Switch, Dimmer, Binary/Numeric Sensor, RGBW light, Button).
+* Select the ``Zwave item`` to bind (a node value imported by the gateway). For Buttons, point to the Central Scene “event”.
+* For Dimmers, set UI ``min/max``; device range mapping is handled internally.
+* Save — the component value updates live. Battery levels propagate to ``Component.battery_level``.
 
-After restart: gateway, device path, logs
------------------------------------------
+Migration from OpenZWave
+------------------------
 
-After installation and restart, a ``Zwave`` gateway is created
-automatically with default settings. Open it in Django Admin to confirm
-the USB device path (defaults to ``/dev/ttyACM0``). Adjust if your stick
-appears as another path (for example ``/dev/ttyUSB0``). The gateway page
-also shows helpful logs.
+Upgrading from older ``simo-zwave`` based on OpenZWave requires no re‑inclusion:
 
-Include new Z‑Wave devices (Admin)
-----------------------------------
-
-1. Go to Django Admin → ``Zwave nodes`` → “Add” (top right).
-2. If you have more than one Z‑Wave gateway, pick the target gateway.
-3. The page starts inclusion and shows live updates. Put each device into
-   inclusion mode; discovered nodes appear on the page.
-4. Click “Finish!” to cancel inclusion and mark new nodes as configured.
-
-Exclude devices (Admin)
------------------------
-
-Open the “Remove nodes” page under ``Zwave nodes`` in Django Admin. Start
-exclusion, put devices into remove mode, then click “Finish!” to cancel.
-
-Prepare values for components (Admin)
--------------------------------------
-
-Open a node in Admin. Its values are listed inline:
-
-* Name the values you plan to use in components. Only values with a name
-  and ``genre = User`` appear in component forms.
-* For writable values, you can set a new value; “pending” indicates a
-  value that will be sent to the device.
-
-Add Z‑Wave components (SIMO.io app)
------------------------------------
-
-1. Components → Add New → Component.
-2. Select Gateway: ``Zwave``.
-3. Select Component type: choose based on the target value:
-   - ``Switch`` or ``Binary sensor`` for Bool/Button values.
-   - ``Dimmer`` for percentage/level values (0–99, 0–255, etc.).
-   - ``Numeric sensor`` for scalar readings (°C, W, %, …).
-   - ``RGBW light`` for color‑capable devices.
-4. Complete the form:
-   - ``Zwave item``: pick a named value from the device.
-   - For ``Dimmer``: set display ``min/max`` and Z‑Wave ``zwave_min``/``zwave_max``
-     to map the device range to 0–100.
-   - For ``Switch``: optionally set ``slaves`` (other components to follow).
-   - Usual component fields (name, room, category, icon).
-5. Save. The component reflects live value and stays in sync with the node.
-
-OpenZWave library updates (Admin)
----------------------------------
-
-The gateway form exposes an “Update OpenZWave devices library” button.
-Click to download the latest device configs from the OpenZWave project.
-Gateways stop briefly during update and auto‑resume afterward.
+* Keep the same USB stick and network keys; configure Z‑Wave JS UI as above.
+* On first run, the gateway imports nodes/values from Z‑Wave JS and updates existing rows where possible
+  (prefers matching by name/label on the same node). Existing components continue to work without changes.
 
 Troubleshooting
 ---------------
 
-* Cannot start gateway / no USB device:
-  - Verify the ``device`` path in the gateway (e.g., ``/dev/ttyACM0``).
-  - Check OS permissions for the SIMO process user (e.g., dialout group).
-* Inclusion/exclusion stalls: Click “Finish!” to cancel, then retry.
-* Value not appearing in component form: Ensure the Node Value is named
-  and has ``genre = User``; wait for the next update.
-* Odd levels on dimmers: Adjust ``zwave_min``/``zwave_max`` to match the
-  device’s native range; set display ``min/max`` for your preferred scale.
-* Missing device parameters: Update the OpenZWave library from Admin.
+* No values appearing: Confirm Z‑Wave JS UI is running, serial port correct, and devices finished interview. Wake battery devices.
+* Inclusion/exclusion not starting: Ensure the gateway is running and use the Admin pages as described.
+* Central Scene: Button supports 'click', 'double‑click', 'triple‑click', 'quadruple‑click', 'quintuple‑click', 'hold', 'up'.
+* Port security: WS (3000) is loopback‑only. UI (8091) is closed by default and can be temporarily opened from the gateway form.
 
 Upgrade
 -------

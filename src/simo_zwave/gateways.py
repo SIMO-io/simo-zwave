@@ -38,7 +38,6 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
     # --------------- Lifecycle ---------------
     def run(self, exit):
         self.exit = exit
-        self.logger = logging.getLogger(f"simo.gw.{self.gateway_instance.id}")
         # Start MQTT command listener (BaseObjectCommandsGatewayHandler)
         super().run(exit)
 
@@ -128,7 +127,16 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         value = float(value) if '.' in value else int(value)
                     except Exception:
                         pass
-            self._async_call(self._set_value(node_val, value))
+            # If addressing is missing (legacy rows), try to find a sibling with addressing
+            nv = node_val
+            if not nv.command_class:
+                from django.db.models import Q
+                alt = NodeValue.objects.filter(node=nv.node).filter(
+                    Q(name__iexact=nv.name) | Q(label__iexact=nv.label)
+                ).exclude(pk=nv.pk).first()
+                if alt and alt.command_class:
+                    nv = alt
+            self._async_call(self._set_value(nv, value))
         except Exception as e:
             self.logger.error(f"Send error: {e}", exc_info=True)
 
@@ -276,11 +284,19 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         ).order_by('-component__isnull').first()
         created = False
         if not nv:
-            nv, created = NodeValue.objects.get_or_create(
-                node=zn,
-                value_id=hash((cc, endpoint, str(prop), str(prop_key))),
-                defaults=data,
+            # Try to reuse a single existing assigned value with matching type/units (best-effort)
+            cands = NodeValue.objects.filter(
+                node=zn, component__isnull=False, type=str(vtype), units=units
             )
+            if cands.count() == 1:
+                nv = cands.first()
+                created = False
+            else:
+                nv, created = NodeValue.objects.get_or_create(
+                    node=zn,
+                    value_id=hash((cc, endpoint, str(prop), str(prop_key))),
+                    defaults=data,
+                )
         else:
             for k, v in data.items():
                 setattr(nv, k, v)

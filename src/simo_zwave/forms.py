@@ -205,7 +205,7 @@ class BasicZwaveComponentConfigForm(BaseComponentForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         qs = NodeValue.objects.filter(
-            node__gateway=self.gateway, genre='User', name__isnull=False,
+            node__gateway=self.gateway, name__isnull=False,
         ).filter(
             Q(component=None) | Q(component=self.instance)
         ).order_by('node_id', 'id')

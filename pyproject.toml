@@ -9,7 +9,7 @@ authors = [
   { name="Simon V.", email="simon@simo.io" },
 ]
 description = "Z-Wave JS integration for SIMO.io"
-readme = "README.md"
+readme = "README.rst"
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Python :: 3",

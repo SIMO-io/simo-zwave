@@ -1,6 +1,6 @@
 from simo.core.controllers import (
     BinarySensor, NumericSensor,
-    Switch, Dimmer, RGBWLight
+    Switch, Dimmer, RGBWLight, Button
 )
 from .gateways import ZwaveGatewayHandler
 from .forms import (
@@ -63,3 +63,43 @@ class ZwaveRGBWLight(RGBWLight):
     def _receive_from_device(self, val):
         # TODO: need to addapt to map type RGBWLight value.
         return super()._receive_from_device(val)
+
+
+class ZwaveButton(Button):
+    gateway_class = ZwaveGatewayHandler
+    config_form = BasicZwaveComponentConfigForm
+
+    def _receive_from_device(self, val):
+        # Map Z-Wave JS Central Scene event values to Button states.
+        # Accept both numeric codes and string labels.
+        mapping_num = {
+            0: 'click',            # KeyPressed
+            1: 'up',               # KeyReleased
+            2: 'hold',             # KeyHeldDown
+            3: 'double-click',     # KeyPressed2x
+            4: 'triple-click',     # KeyPressed3x
+            5: 'quadruple-click',  # KeyPressed4x
+            6: 'quintuple-click',  # KeyPressed5x
+        }
+        mapping_str = {
+            'KeyPressed': 'click',
+            'KeyReleased': 'up',
+            'KeyHeldDown': 'hold',
+            'KeyPressed2x': 'double-click',
+            'KeyPressed3x': 'triple-click',
+            'KeyPressed4x': 'quadruple-click',
+            'KeyPressed5x': 'quintuple-click',
+        }
+        try:
+            if isinstance(val, (int, float)):
+                v = mapping_num.get(int(val))
+                if v:
+                    return super()._receive_from_device(v)
+            elif isinstance(val, str):
+                v = mapping_str.get(val) or val.lower()
+                # accept already-normalized values too
+                return super()._receive_from_device(v)
+        except Exception:
+            pass
+        # Fallback: ignore unknowns
+        return
