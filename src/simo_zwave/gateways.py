@@ -24,7 +24,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
     name = "Z-Wave JS"
     config_form = ZwaveGatewayForm
     auto_create = True
-    periodic_tasks = (('maintain', 10), ('ufw_expiry_check', 60), ('sync_values', 10))
+    periodic_tasks = (('maintain', 10), ('ufw_expiry_check', 60), ('sync_values', 10), ('migrate_legacy', 5))
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -117,6 +117,112 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 self._async_call(self._import_driver_state())
         except Exception:
             pass
+
+    # --- Legacy bindings migration (one-time) ---
+    _migrating = False
+
+    def migrate_legacy(self):
+        try:
+            if self._migrating:
+                return
+            cfg = self.gateway_instance.config or {}
+            if cfg.get('legacy_migration_done'):
+                return
+            if not (self._client and self._client.connected):
+                return
+            self._migrating = True
+            from simo_zwave.models import NodeValue
+            # Only migrate rows bound to components and without addressing
+            pending = list(NodeValue.objects.filter(
+                node__gateway=self.gateway_instance,
+                component__isnull=False,
+                command_class__isnull=True
+            )[:25])
+            if not pending:
+                cfg['legacy_migration_done'] = True
+                self.gateway_instance.config = cfg
+                self.gateway_instance.save(update_fields=['config'])
+                return
+            for nv in pending:
+                try:
+                    self._migrate_one_legacy(nv)
+                except Exception:
+                    continue
+        finally:
+            self._migrating = False
+
+    def _migrate_one_legacy(self, nv: 'NodeValue'):
+        comp = nv.component
+        if not comp:
+            return
+        # Map base_type to CC target and expected write pattern
+        base_type = (comp.base_type or '').lower()
+        if base_type in ('switch', 'lock', 'blinds', 'gate', 'rgbw-light'):
+            cc = 37  # Binary Switch as default for switch-like
+        elif base_type in ('dimmer',):
+            cc = 38  # Multilevel Switch
+        else:
+            return
+        # Fetch defined value ids
+        try:
+            resp = self._async_call(self._client.async_send_command({
+                'command': 'node.get_defined_value_ids',
+                'nodeId': nv.node.node_id,
+            }))
+        except Exception:
+            return
+        items = resp
+        if isinstance(items, dict):
+            items = items.get('valueIds') or items.get('result') or []
+        if not isinstance(items, list):
+            return
+        # filter by CC
+        def getf(item, key, fallback=None):
+            if isinstance(item, dict):
+                return item.get(key, fallback)
+            trans = {'commandClass': 'command_class', 'propertyKey': 'property_key', 'propertyName': 'property_name'}
+            return getattr(item, trans.get(key, key), fallback)
+        cands = [i for i in items if getf(i, 'commandClass') == cc]
+        # For switches/dimmers prefer 'targetValue'
+        cands_target = [i for i in cands if getf(i, 'property') == 'targetValue'] or cands
+        # If multiple endpoints, try to match by currentValue against our stored value
+        chosen = None
+        if base_type in ('switch', 'dimmer'):
+            desired = nv.value
+            # normalize desired for dimmer
+            if base_type == 'dimmer' and isinstance(desired, (int, float)):
+                desired = int(desired)
+            for item in cands_target:
+                vid = {'commandClass': getf(item, 'commandClass'), 'endpoint': getf(item, 'endpoint') or 0,
+                       'property': 'currentValue'}
+                try:
+                    cur = self._async_call(self._client.async_send_command({
+                        'command': 'node.get_value', 'nodeId': nv.node.node_id, 'valueId': vid
+                    }))
+                    cur_val = cur.get('value') if isinstance(cur, dict) else None
+                    if base_type == 'switch':
+                        if isinstance(cur_val, bool) and isinstance(nv.value, bool) and cur_val == nv.value:
+                            chosen = item
+                            break
+                    else:
+                        try:
+                            if cur_val is not None and abs(int(cur_val) - int(desired)) <= 5:
+                                chosen = item
+                                break
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+        if not chosen and cands_target:
+            chosen = cands_target[0]
+        if not chosen:
+            return
+        # Persist mapping
+        nv.command_class = getf(chosen, 'commandClass')
+        nv.endpoint = getf(chosen, 'endpoint') or 0
+        nv.property = 'targetValue'
+        nv.property_key = None
+        nv.save(update_fields=['command_class', 'endpoint', 'property', 'property_key'])
 
     # --------------- MQTT commands ---------------
     def perform_value_send(self, component, value):
