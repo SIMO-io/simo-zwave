@@ -206,40 +206,42 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 return
             etype = str(event.get('type') or '')
             is_alive = etype != 'dead'
-            # Update ZwaveNode.alive
-            from .models import ZwaveNode as ZN, NodeValue as NV
-            zn = ZN.objects.filter(gateway=self.gateway_instance, node_id=getattr(node, 'node_id', None)).first()
-            if not zn:
-                return
-            if zn.alive != is_alive:
-                zn.alive = is_alive
-                zn.save(update_fields=['alive'])
-            # Propagate availability to all components bound to this node
-            try:
-                # Fetch distinct components connected to this node
-                comps = [nv.component for nv in NV.objects.filter(node=zn, component__isnull=False).select_related('component')]
-                seen = set()
-                for comp in comps:
-                    if not comp or comp.id in seen:
-                        continue
-                    seen.add(comp.id)
-                    try:
-                        comp.controller._receive_from_device(comp.value, is_alive=is_alive)
-                    except Exception:
-                        self.logger.error(
-                            f"Failed to propagate availability to component {getattr(comp,'id',None)} for node {zn.node_id}",
-                            exc_info=True,
-                        )
+            node_id = getattr(node, 'node_id', None)
+            # Defer all DB work to a thread to avoid async ORM errors
+            def _apply_status():
+                from .models import ZwaveNode as ZN, NodeValue as NV
+                zn = ZN.objects.filter(gateway=self.gateway_instance, node_id=node_id).first()
+                if not zn:
+                    return
+                if zn.alive != is_alive:
+                    zn.alive = is_alive
+                    zn.save(update_fields=['alive'])
+                try:
+                    comps = [nv.component for nv in NV.objects.filter(node=zn, component__isnull=False).select_related('component')]
+                    seen = set()
+                    for comp in comps:
+                        if not comp or comp.id in seen:
+                            continue
+                        seen.add(comp.id)
                         try:
-                            comp.alive = is_alive
-                            comp.save(update_fields=['alive'])
+                            comp.controller._receive_from_device(comp.value, is_alive=is_alive)
                         except Exception:
                             self.logger.error(
-                                f"Failed to persist availability directly for component {getattr(comp,'id',None)}",
+                                f"Failed to propagate availability to component {getattr(comp,'id',None)} for node {zn.node_id}",
                                 exc_info=True,
                             )
-            except Exception:
-                self.logger.error("Failed availability propagation sweep", exc_info=True)
+                            try:
+                                comp.alive = is_alive
+                                comp.save(update_fields=['alive'])
+                            except Exception:
+                                self.logger.error(
+                                    f"Failed to persist availability directly for component {getattr(comp,'id',None)}",
+                                    exc_info=True,
+                                )
+                except Exception:
+                    self.logger.error("Failed availability propagation sweep", exc_info=True)
+
+            asyncio.run_coroutine_threadsafe(asyncio.to_thread(_apply_status), self._loop)
         except Exception:
             self.logger.error("Unhandled exception in node status event", exc_info=True)
 
@@ -276,7 +278,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         self.logger.info("Sync tick: importing state")
                 except Exception:
                     pass
-                self._async_call(self._import_driver_state())
+                self._async_call(self._import_driver_state(), timeout=60)
         except Exception:
             self.logger.error("Periodic sync failed", exc_info=True)
 
@@ -538,11 +540,11 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 await self._client.async_send_command({'command': 'controller.replace_failed_node', 'nodeId': node_id})
 
     # --------------- WS helpers ---------------
-    def _async_call(self, coro):
+    def _async_call(self, coro, timeout: int = 15):
         if not self._loop:
             raise RuntimeError('WS loop not started')
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result(timeout=15)
+        return fut.result(timeout=timeout)
 
     def _build_ws_url(self) -> str:
         return 'ws://127.0.0.1:3000'
