@@ -28,7 +28,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._ws_url = 'ws://127.0.0.1:3000'
+        self._ws_url = self._build_ws_url()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._client: Optional[ZJSClient] = None
         self._thread: Optional[threading.Thread] = None
@@ -88,6 +88,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
     # --------------- Periodic tasks ---------------
     def maintain(self):
         # Ensure WS thread is running
+        # Refresh WS URL from config in case it changed
+        self._ws_url = self._build_ws_url()
         self._start_ws_thread()
 
     def ufw_expiry_check(self):
@@ -215,6 +217,15 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             raise RuntimeError('WS loop not started')
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return fut.result(timeout=15)
+
+    def _build_ws_url(self) -> str:
+        try:
+            cfg = self.gateway_instance.config or {}
+            host = cfg.get('ws_host') or '127.0.0.1'
+            port = int(cfg.get('ws_port') or 3000)
+            return f'ws://{host}:{port}'
+        except Exception:
+            return 'ws://127.0.0.1:3000'
 
     async def _set_value(self, node_val: NodeValue, value):
         if not self._client or not self._client.connected:
