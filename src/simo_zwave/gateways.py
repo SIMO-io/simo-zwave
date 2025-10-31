@@ -24,7 +24,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
     name = "Z-Wave JS"
     config_form = ZwaveGatewayForm
     auto_create = True
-    periodic_tasks = (('maintain', 10), ('ufw_expiry_check', 60))
+    periodic_tasks = (('maintain', 10), ('ufw_expiry_check', 60), ('sync_values', 10))
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -38,6 +38,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
     # --------------- Lifecycle ---------------
     def run(self, exit):
         self.exit = exit
+        # Start WS thread immediately to avoid early send attempts failing
+        self._start_ws_thread()
         # Start MQTT command listener (BaseObjectCommandsGatewayHandler)
         super().run(exit)
 
@@ -59,22 +61,20 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         backoff = 1
         while not self.exit.is_set():
             try:
-                self._client = ZJSClient(self._ws_url)
+                import aiohttp
+                session = aiohttp.ClientSession()
+                self._client = ZJSClient(self._ws_url, session)
                 await self._client.connect()
                 self._connected = True
                 backoff = 1
-                # Start listening and get full state
-                res = await self._client.async_send_command({
-                    'command': 'start_listening'
-                })
-                state = res.get('result', {}).get('state') or res.get('state') or {}
-                await self._handle_full_state(state)
-                # Passive listen loop
-                while not self.exit.is_set() and self._client.connected:
-                    msg = await self._client.receive_json_or_none()
-                    if msg is None:
-                        break
-                    self._handle_event(msg)
+                # Start listening and wait until driver is ready
+                driver_ready = asyncio.Event()
+                listen_task = asyncio.create_task(self._client.listen(driver_ready))
+                await driver_ready.wait()
+                # Import full state from driver model
+                await self._import_driver_state()
+                # Keep task running until closed
+                await listen_task
             except Exception as e:
                 self._connected = False
                 try:
@@ -105,6 +105,14 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 self.gateway_instance.config = cfg
                 self.gateway_instance.save(update_fields=['config'])
                 self.logger.info("Closed temporary Z-Wave UI access (expired)")
+        except Exception:
+            pass
+
+    def sync_values(self):
+        # Periodically import current driver state into DB so values remain fresh
+        try:
+            if self._client and self._client.connected:
+                self._async_call(self._import_driver_state())
         except Exception:
             pass
 
@@ -223,10 +231,37 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             payload['propertyKey'] = node_val.property_key
         await self._client.async_send_command(payload)
 
-    async def _handle_full_state(self, state: Dict[str, Any]):
-        nodes = state.get('nodes', [])
-        for n in nodes:
-            await self._import_node(n)
+    async def _import_driver_state(self):
+        if not self._client or not self._client.driver:
+            return
+        driver = self._client.driver
+        try:
+            nodes = list(driver.controller.nodes.values())
+        except Exception:
+            nodes = []
+        for node in nodes:
+            try:
+                # Build a pseudo state dict for import
+                state = {
+                    'nodeId': node.node_id,
+                    'name': getattr(node, 'name', '') or '',
+                    'productLabel': getattr(node, 'product_label', '') or '',
+                    'values': [
+                        {
+                            'commandClass': v.command_class,
+                            'endpoint': v.endpoint,
+                            'property': v.property,
+                            'propertyKey': v.property_key,
+                            'propertyName': getattr(v, 'property_name', None),
+                            'value': v.value,
+                            'metadata': getattr(v, 'metadata', {}) or {},
+                        }
+                        for v in getattr(node, 'values', {}).values()
+                    ],
+                }
+                await self._import_node(state)
+            except Exception:
+                self.logger.error("Failed to import node state", exc_info=True)
 
     async def _import_node(self, node_state: Dict[str, Any]):
         node_id = node_state.get('nodeId') or node_state.get('id')
@@ -312,15 +347,5 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             except Exception:
                 self.logger.error("Failed to set component value", exc_info=True)
 
-    def _handle_event(self, msg: Dict[str, Any]):
-        # Expect events like {'type': 'event', 'event': 'value updated', 'nodeId': .., 'value': {...}}
-        if msg.get('type') == 'event' and 'value' in msg:
-            node_id = msg.get('nodeId') or (msg.get('source') or {}).get('nodeId')
-            if not node_id:
-                return
-            zn = ZwaveNode.objects.filter(node_id=node_id, gateway=self.gateway_instance).first()
-            if not zn:
-                return
-            val = msg.get('value')
-            if isinstance(val, dict):
-                self._import_value(zn, val)
+    # With client.listen(), the library updates the driver model internally.
+    # We keep DB in sync via periodic full imports or future event hooks.

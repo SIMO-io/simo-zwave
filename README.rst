@@ -39,7 +39,16 @@ Install Z‑Wave JS UI (Snap)
    sudo snap connect zwave-js-ui:raw-usb
    sudo snap connect zwave-js-ui:hardware-observe
 
-Open the UI at http://localhost:8091 on the hub (or use the 12h exposure toggle below) and set:
+Z‑Wave JS UI access (from SIMO Admin)
+-------------------------------------
+
+1) Go to SIMO.io Django Admin → Gateways → Z‑Wave JS.
+
+2) Enable “Expose Z‑Wave JS UI on LAN for 12 hours”. This opens UFW for port 8091 to your LAN and shows the URL.
+
+3) Open the shown URL (e.g., ``http://<hub-ip>:8091``). Default credentials: ``admin / zwave``.
+
+Then in the Z‑Wave JS UI, set:
 
 * Settings → Z‑Wave → Serial Port: select ``/dev/serial/by-id/...`` for your stick.
 * Settings → Z‑Wave → Security Keys: define S0 and S2 keys; keep a backup.
@@ -76,9 +85,7 @@ Gateway & Local UI access
 
 After restart, a ``Z‑Wave JS`` gateway is auto‑created. Open it in Django Admin:
 
-* “Expose Z‑Wave JS UI on LAN for 12 hours” — toggling ON opens UFW for port 8091 to RFC1918 ranges,
-  shows the local URL (e.g., ``http://<hub-ip>:8091``) and an expiry timestamp, and auto‑closes after 12h.
-  Default UI credentials are ``admin / zwave`` (change them in Z‑Wave JS UI).
+* To access the Z‑Wave JS UI from your LAN, enable “Expose Z‑Wave JS UI on LAN for 12 hours”. It opens UFW for port 8091, shows the URL, and auto‑closes after 12h. Default ZUI credentials: ``admin / zwave``.
 * The Z‑Wave JS WebSocket API stays bound to ``127.0.0.1:3000`` and is never exposed.
 
 Inclusion / Exclusion (Django Admin)
