@@ -237,17 +237,34 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
     async def _set_value(self, node_val: NodeValue, value):
         if not self._client or not self._client.connected:
             raise RuntimeError('Z-Wave JS not connected')
-        payload = {
-            'command': 'set_value',
-            'nodeId': node_val.node.node_id,
+        # Prefer modern API: node.set_value
+        value_id = {
             'commandClass': node_val.command_class,
             'endpoint': node_val.endpoint or 0,
             'property': node_val.property,
-            'value': value,
         }
         if node_val.property_key not in (None, ''):
-            payload['propertyKey'] = node_val.property_key
-        await self._client.async_send_command(payload)
+            value_id['propertyKey'] = node_val.property_key
+        try:
+            await self._client.async_send_command({
+                'command': 'node.set_value',
+                'nodeId': node_val.node.node_id,
+                'valueId': value_id,
+                'value': value,
+            })
+        except Exception:
+            # Fallback for older servers
+            payload = {
+                'command': 'set_value',
+                'nodeId': node_val.node.node_id,
+                'commandClass': node_val.command_class,
+                'endpoint': node_val.endpoint or 0,
+                'property': node_val.property,
+                'value': value,
+            }
+            if node_val.property_key not in (None, ''):
+                payload['propertyKey'] = node_val.property_key
+            await self._client.async_send_command(payload)
 
     async def _import_driver_state(self):
         if not self._client or not self._client.driver:
