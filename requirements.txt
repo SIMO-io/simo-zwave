@@ -1,2 +1,2 @@
-simo>=1.5.9
-python-openzwave==0.4.19
+simo>=3.1.7
+zwave-js-server-python>=0.67.1

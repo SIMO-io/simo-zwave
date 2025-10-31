@@ -1,266 +1,310 @@
-import os
-import logging
+import asyncio
 import json
-import sys
-from openzwave.network import ZWaveNetwork
-from openzwave.option import ZWaveOption
-import paho.mqtt.client as mqtt
-from pydispatch import dispatcher
+import logging
+import threading
 import time
+from typing import Dict, Any, Optional
+
+import paho.mqtt.client as mqtt
 from django.conf import settings
+
 from simo.core.models import Component
-from simo.core.gateways import BaseGatewayHandler
+from simo.core.gateways import BaseObjectCommandsGatewayHandler
 from simo.core.events import GatewayObjectCommand, get_event_obj
-from simo.conf import dynamic_settings
 from .forms import ZwaveGatewayForm
 from .models import ZwaveNode, NodeValue
 
+try:
+    from zwave_js_server.client import Client as ZJSClient
+except Exception:  # pragma: no cover - library not installed yet
+    ZJSClient = None
 
-class ZwaveGatewayHandler(BaseGatewayHandler):
-    name = "Zwave"
+
+class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
+    name = "Z-Wave JS"
     config_form = ZwaveGatewayForm
     auto_create = True
-    network = None
+    periodic_tasks = (('maintain', 10), ('ufw_expiry_check', 60))
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ws_url = 'ws://127.0.0.1:3000'
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._client: Optional[ZJSClient] = None
+        self._thread: Optional[threading.Thread] = None
+        self._connected = False
+        self._last_state: Dict[str, Any] = {}
+
+    # --------------- Lifecycle ---------------
     def run(self, exit):
-        print("Starting Zwave Gateway")
-        mqtt_client = mqtt.Client()
-        mqtt_client.username_pw_set('root', settings.SECRET_KEY)
+        self.exit = exit
+        self.logger = logging.getLogger(f"simo.gw.{self.gateway_instance.id}")
+        # Start MQTT command listener (BaseObjectCommandsGatewayHandler)
+        super().run(exit)
 
-        try:
-            config_path = dynamic_settings['zwave__ozwave_config_path_community']
-            if not os.path.exists(config_path):
-                os.makedirs(config_path)
-            user_path = dynamic_settings['zwave__ozwave_config_path_user']
-            if not os.path.exists(user_path):
-                os.makedirs(user_path)
-
-            options = ZWaveOption(
-                device=self.gateway_instance.config['device'],
-                config_path=dynamic_settings['zwave__ozwave_config_path_community'],
-                user_path=dynamic_settings['zwave__ozwave_config_path_user']
-            )
-            options.addOptionString(
-                'NetworkKey', dynamic_settings['zwave__netkey'], False
-            )
-            options.lock()
-
-            self.network = ZWaveNetwork(options, autostart=False)
-            dispatcher.connect(
-                self.network_ready, ZWaveNetwork.SIGNAL_NETWORK_AWAKED
-            )
-            self.network.start()
-
-
-            mqtt_client.on_connect = self.on_mqtt_connect
-            mqtt_client.on_message = self.on_mqtt_message
-            mqtt_client.connect(
-                host=settings.MQTT_HOST, port=settings.MQTT_PORT
-            )
-            mqtt_client.loop_start()
-
-            seconds_counter = 0
-            while not exit.is_set():
-                time.sleep(1)
-                if seconds_counter > 30:
-                    self.perform_periodic_maintenance()
-                    seconds_counter = 0
-                else:
-                    seconds_counter += 1
-
-            print("I must stop now!")
-            mqtt_client.loop_stop()
-            print("MQTT stopped!")
-            self.network.stop()
-            print("Network stopped!")
-
-        except SystemExit:
-            print("STOPPING.....")
-            mqtt_client.loop_stop()
-            self.network.stop()
-            raise SystemExit()
-
-    def on_mqtt_connect(self, mqtt_client, userdata, flags, rc):
-        print("Connected to mqtt with result code " + str(rc))
-        command = GatewayObjectCommand(self.gateway_instance)
-        mqtt_client.subscribe(command.get_topic())
-
-    def on_mqtt_message(self, client, userdata, msg):
-        payload = json.loads(msg.payload)
-
-        if 'zwave_command' in payload:
-            if not hasattr(self.network, payload['zwave_command']):
-                return
-            zwave_command = getattr(
-                self.network.controller, payload['zwave_command']
-            )
-            if 'node_id' in payload:
-                kwargs = {'node_id': payload['node_id']}
-            else:
-                kwargs = {}
-            try:
-                zwave_command(**kwargs)
-            except Exception as e:
-                print(e, file=sys.stderr)
-                return
-            else:
-                print("Command %s initiated!" % payload['command'])
-                self.gateway_instance.refresh_from_db()
-                if payload['command'] == 'cancel_command' \
-                and 'last_controller_command' in self.gateway_instance.config:
-                    self.gateway_instance.config.pop('last_controller_command')
-                    self.gateway_instance.save()
+    def _start_ws_thread(self):
+        if self._thread and self._thread.is_alive():
             return
+        self._thread = threading.Thread(target=self._ws_main, daemon=True)
+        self._thread.start()
 
-        if 'bulk_send' in payload:
-            components = {c.id: c for c in Component.objects.filter(
-                gateway__type=self.uid,
-                id__in=[int(id) for id in payload['bulk_send'].keys()]
-            )}
-            for comp_id, value in payload['bulk_send'].items():
-                if int(comp_id) not in components:
-                    continue
-                comp = components[int(comp_id)]
+    def _ws_main(self):
+        if ZJSClient is None:
+            self.logger.error("zwave-js-server-python not installed; cannot connect")
+            return
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._ws_connect_and_listen())
+
+    async def _ws_connect_and_listen(self):
+        backoff = 1
+        while not self.exit.is_set():
+            try:
+                self._client = ZJSClient(self._ws_url)
+                await self._client.connect()
+                self._connected = True
+                backoff = 1
+                # Start listening and get full state
+                res = await self._client.async_send_command({
+                    'command': 'start_listening'
+                })
+                state = res.get('result', {}).get('state') or res.get('state') or {}
+                await self._handle_full_state(state)
+                # Passive listen loop
+                while not self.exit.is_set() and self._client.connected:
+                    msg = await self._client.receive_json_or_none()
+                    if msg is None:
+                        break
+                    self._handle_event(msg)
+            except Exception as e:
+                self._connected = False
                 try:
-                    value = comp.controller._string_to_vals(str(value))[0]
-                except:
+                    self.logger.warning(f"WS disconnected: {e}")
+                except Exception:
                     pass
-                self.send_val(components[int(comp_id)], value)
-            return
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
 
-        target = get_event_obj(payload)
-        if isinstance(target, Component):
-            if 'set_val' not in payload:
-                return
-            self.send_val(target, payload['set_val'])
+    # --------------- Periodic tasks ---------------
+    def maintain(self):
+        # Ensure WS thread is running
+        self._start_ws_thread()
 
-    def send_val(self, target, val):
-        if isinstance(target, NodeValue):
-            node_val = target
-        else:
-            try:
-                node_val = NodeValue.objects.get(
-                    pk=target.config.get('zwave_item', 0)
-                )
-            except:
-                return
+    def ufw_expiry_check(self):
         try:
-            nodev = self.network.nodes[
-                node_val.node.node_id
-            ].values[node_val.value_id]
-            nodev.data = val
+            cfg = self.gateway_instance.config or {}
+            if not cfg.get('ui_open'):
+                return
+            if cfg.get('ui_expires_at', 0) < time.time():
+                from .forms import ZwaveGatewayForm
+                # Reuse helper to close rules
+                form = ZwaveGatewayForm(instance=self.gateway_instance)
+                form._ufw_deny_8091_lan()
+                cfg['ui_open'] = False
+                cfg.pop('ui_expires_at', None)
+                self.gateway_instance.config = cfg
+                self.gateway_instance.save(update_fields=['config'])
+                self.logger.info("Closed temporary Z-Wave UI access (expired)")
+        except Exception:
+            pass
+
+    # --------------- MQTT commands ---------------
+    def perform_value_send(self, component, value):
+        node_val = NodeValue.objects.filter(
+            pk=component.config.get('zwave_item')
+        ).first()
+        if not node_val:
+            return
+        try:
+            # Attempt to coerce string values
+            if isinstance(value, str):
+                if value.lower() in ('true', 'on'):
+                    value = True
+                elif value.lower() in ('false', 'off'):
+                    value = False
+                else:
+                    try:
+                        value = float(value) if '.' in value else int(value)
+                    except Exception:
+                        pass
+            self._async_call(self._set_value(node_val, value))
         except Exception as e:
-            pass
+            self.logger.error(f"Send error: {e}", exc_info=True)
 
-    def update_node_stats(self, node_model):
-
-        try:
-            zwave_node = self.network.nodes[node_model.node_id]
-            node_model.stats = zwave_node.stats
-        except KeyError:
-            node_model.alive = False
-        else:
-            node_model.product_name = zwave_node.product_name
-            node_model.product_type = zwave_node.type
-            node_model.alive = not zwave_node.is_failed
-            node_model.battery_level = zwave_node.get_battery_level()
-
-        node_model.save()
-
-        for node_val in node_model.node_values.all().exclude(component=None):
-            node_val.component.alive = node_model.alive
-            node_val.component.battery_level = node_model.battery_level
-            node_val.component.save()
-
-    def perform_periodic_maintenance(self):
-        self.gateway_instance.refresh_from_db()
-        last_controller_command = self.gateway_instance.config.get(
-            'last_controller_command'
-        )
-        if last_controller_command \
-        and time.time() - last_controller_command > 20:
-            self.network.controller.cancel_command()
-            self.gateway_instance.config.pop('last_controller_command')
-            self.gateway_instance.save()
-            print("CANCELED ALL COMMANDS!!!!")
-        for node_model in self.gateway_instance.zwave_nodes.all():
-            self.update_node_stats(node_model)
-
-
-    def update_node_val(self, node, val):
-        node = ZwaveNode.objects.filter(node_id=node.node_id).first()
-        if not node:
-            self.update_node_model(node)
-
-        data = {
-            'genre': val.genre, 'type': val.type, 'label': val.label,
-            'is_read_only': val.is_read_only, 'index': val.index,
-            'units': val.units, 'value': val.data,
-            'value_new': val.data,
-            'value_choices': list(val.data_items) if val.type == 'List' else [],
-        }
-        node_val, new = NodeValue.objects.get_or_create(
-            node=node, value_id=val.value_id, defaults=data
-        )
-        if not new:
-            for attr, v in data.items():
-                setattr(node_val, attr, v)
-                node_val.save()
-        if node_val.label.lower().startswith('battery lev') \
-                and val.units == '%':
-            node_val.node.battery_level = val.data
-            node_val.node.save()
-
-        if node_val.component:
+    def perform_bulk_send(self, data):
+        components = {c.id: c for c in Component.objects.filter(
+            gateway=self.gateway_instance, id__in=[int(i) for i in data.keys()]
+        )}
+        for comp_id, val in data.items():
+            comp = components.get(int(comp_id))
+            if not comp:
+                continue
             try:
-                node_val.component.controller._receive_from_device(
-                    node_val.value
-                )
+                self.perform_value_send(comp, val)
             except Exception as e:
-                logging.exception("Unable to save value to component!")
-                logging.error(e, exc_info=True)
+                self.logger.error(e, exc_info=True)
 
-
-
-    def update_node_model(self, node):
-        if node.product_type == '0x0001' or node.node_id in (1, 255):
-            # Static PC Controller
-            return
-
-        node_model, new = ZwaveNode.objects.get_or_create(
-            node_id=node.node_id, gateway=self.gateway_instance, defaults={
-                'product_name': node.product_name,
-                'product_type': node.type
-            }
-        )
-        self.update_node_stats(node_model)
-
-        for key, val in node.values.items():
-            self.update_node_val(node, val)
-
-    def network_ready(self, network):
-        dispatcher.connect(self.node_update, ZWaveNetwork.SIGNAL_NODE_ADDED)
-        dispatcher.connect(self.node_update, ZWaveNetwork.SIGNAL_NODE)
-        dispatcher.connect(self.node_removed, ZWaveNetwork.SIGNAL_NODE_REMOVED)
-        dispatcher.connect(self.value_update, ZWaveNetwork.SIGNAL_VALUE)
-
-        for node_id, node in self.network.nodes.items():
-            self.update_node_model(node)
-
-    def node_update(self, network, node):
-        self.update_node_model(node)
-
-    def node_removed(self, network, node):
+    # Extend parent MQTT handler to support controller commands
+    def _on_mqtt_message(self, client, userdata, msg):
         try:
-            node_model = ZwaveNode.objects.get(
-                node_id=node.node_id, gateway=self.gateway_instance
-            )
-        except ZwaveNode.DoesNotExist:
-            pass
+            payload = json.loads(msg.payload)
+        except Exception:
+            return super()._on_mqtt_message(client, userdata, msg)
+        if 'zwave_command' in payload:
+            cmd = payload.get('zwave_command')
+            node_id = payload.get('node_id')
+            try:
+                self._async_call(self._controller_command(cmd, node_id))
+            except Exception as e:
+                self.logger.error(f"Controller command error: {e}")
+            return
+        # fallback to default handler (set_val, bulk_send)
+        return super()._on_mqtt_message(client, userdata, msg)
+
+    async def _controller_command(self, cmd: str, node_id: Optional[int]):
+        if not self._client or not self._client.connected:
+            return
+        # Map legacy commands to server API
+        mapping = {
+            'add_node': {'command': 'begin_inclusion'},
+            'remove_node': {'command': 'begin_exclusion'},
+            'stop_inclusion': {'command': 'stop_inclusion'},
+            'stop_exclusion': {'command': 'stop_exclusion'},
+        }
+        if cmd in mapping:
+            await self._client.async_send_command(mapping[cmd])
+            return
+        if cmd == 'cancel_command':
+            # Try to stop both inclusion and exclusion
+            try:
+                await self._client.async_send_command({'command': 'stop_inclusion'})
+            except Exception:
+                pass
+            try:
+                await self._client.async_send_command({'command': 'stop_exclusion'})
+            except Exception:
+                pass
+            return
+        # Node-scoped ops
+        if node_id:
+            if cmd == 'remove_failed_node':
+                await self._client.async_send_command({'command': 'remove_failed_node', 'nodeId': node_id})
+            elif cmd == 'replace_failed_node':
+                await self._client.async_send_command({'command': 'replace_failed_node', 'nodeId': node_id})
+
+    # --------------- WS helpers ---------------
+    def _async_call(self, coro):
+        if not self._loop:
+            raise RuntimeError('WS loop not started')
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return fut.result(timeout=15)
+
+    async def _set_value(self, node_val: NodeValue, value):
+        if not self._client or not self._client.connected:
+            raise RuntimeError('Z-Wave JS not connected')
+        payload = {
+            'command': 'set_value',
+            'nodeId': node_val.node.node_id,
+            'commandClass': node_val.command_class,
+            'endpoint': node_val.endpoint or 0,
+            'property': node_val.property,
+            'value': value,
+        }
+        if node_val.property_key not in (None, ''):
+            payload['propertyKey'] = node_val.property_key
+        await self._client.async_send_command(payload)
+
+    async def _handle_full_state(self, state: Dict[str, Any]):
+        nodes = state.get('nodes', [])
+        for n in nodes:
+            await self._import_node(n)
+
+    async def _import_node(self, node_state: Dict[str, Any]):
+        node_id = node_state.get('nodeId') or node_state.get('id')
+        if not node_id:
+            return
+        name = node_state.get('name') or ''
+        product = node_state.get('productLabel') or node_state.get('productType') or ''
+        zn, _ = ZwaveNode.objects.get_or_create(
+            node_id=node_id, gateway=self.gateway_instance,
+            defaults={'product_name': product, 'product_type': product}
+        )
+        if name and zn.name != name:
+            zn.name = name
+        zn.alive = True
+        zn.save()
+        values = node_state.get('values', {})
+        if isinstance(values, dict):
+            vals_iter = values.values()
         else:
-            node_model.delete()
+            vals_iter = values
+        for v in vals_iter:
+            self._import_value(zn, v)
 
-    def value_update(self, network, node, value):
-        self.update_node_val(node, value)
+    def _import_value(self, zn: ZwaveNode, val: Dict[str, Any]):
+        from django.db.models import Q
+        cc = val.get('commandClass')
+        endpoint = val.get('endpoint') or 0
+        prop = val.get('property')
+        prop_key = val.get('propertyKey')
+        label = (val.get('metadata') or {}).get('label') or val.get('propertyName') or str(prop)
+        units = (val.get('metadata') or {}).get('unit') or ''
+        read_only = not (val.get('metadata') or {}).get('writeable', False)
+        vtype = (val.get('metadata') or {}).get('type') or ''
+        current = val.get('value')
+        data = {
+            'genre': None,
+            'type': str(vtype),
+            'label': label,
+            'is_read_only': read_only,
+            'index': None,
+            'units': units,
+            'value': current,
+            'value_new': current,
+            'value_choices': (val.get('metadata') or {}).get('states') or [],
+            'command_class': cc,
+            'endpoint': endpoint,
+            'property': str(prop),
+            'property_key': '' if prop_key is None else str(prop_key),
+        }
+        # Try to match existing rows by user-assigned name or label
+        nv = NodeValue.objects.filter(
+            node=zn
+        ).filter(
+            Q(name__iexact=label) | Q(label__iexact=label)
+        ).order_by('-component__isnull').first()
+        created = False
+        if not nv:
+            nv, created = NodeValue.objects.get_or_create(
+                node=zn,
+                value_id=hash((cc, endpoint, str(prop), str(prop_key))),
+                defaults=data,
+            )
+        else:
+            for k, v in data.items():
+                setattr(nv, k, v)
+        nv.save()
+        # Battery level shortcut
+        if cc == 0x80 and units == '%':
+            zn.battery_level = current
+            zn.save(update_fields=['battery_level'])
+        # Push to component if linked
+        if nv.component:
+            try:
+                nv.component.controller._receive_from_device(nv.value)
+            except Exception:
+                self.logger.error("Failed to set component value", exc_info=True)
 
-
+    def _handle_event(self, msg: Dict[str, Any]):
+        # Expect events like {'type': 'event', 'event': 'value updated', 'nodeId': .., 'value': {...}}
+        if msg.get('type') == 'event' and 'value' in msg:
+            node_id = msg.get('nodeId') or (msg.get('source') or {}).get('nodeId')
+            if not node_id:
+                return
+            zn = ZwaveNode.objects.filter(node_id=node_id, gateway=self.gateway_instance).first()
+            if not zn:
+                return
+            val = msg.get('value')
+            if isinstance(val, dict):
+                self._import_value(zn, val)

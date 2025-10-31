@@ -16,13 +16,81 @@ from .models import ZwaveNode, NodeValue
 from .widgets import AdminNodeValueValueWidget, AdminNodeValueSelectWidget
 
 
-class ZwaveLibraryUpdateBtnWidget(forms.TextInput):
-    template_name = 'admin/zwave/library_update_btn.html'
-
-
 class ZwaveGatewayForm(BaseGatewayForm):
-    device = forms.CharField(initial="/dev/ttyACM0")
-    library = forms.Field(required=False, widget=ZwaveLibraryUpdateBtnWidget())
+    expose_ui = forms.BooleanField(
+        label=_('Expose Z-Wave JS UI on LAN for 12 hours'), required=False
+    )
+    ui_url = forms.CharField(
+        label=_('Local Z-Wave JS UI URL'), required=False,
+        widget=AdminReadonlyFieldWidget()
+    )
+    ui_expires = forms.CharField(
+        label=_('UI access expires at'), required=False,
+        widget=AdminReadonlyFieldWidget()
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # fill readonly fields from gateway config
+        cfg = self.instance.config or {}
+        self.fields['ui_url'].initial = cfg.get('ui_url')
+        expires_at = cfg.get('ui_expires_at')
+        if expires_at:
+            try:
+                import datetime
+                ts = datetime.datetime.fromtimestamp(expires_at)
+                self.fields['ui_expires'].initial = ts.strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                pass
+        # reflect current exposure status
+        self.fields['expose_ui'].initial = bool(cfg.get('ui_open', False))
+
+    def save(self, commit=True):
+        obj = super().save(commit=False)
+        cfg = obj.config or {}
+        requested = self.cleaned_data.get('expose_ui', False)
+        was_open = bool(cfg.get('ui_open', False))
+        # ensure URL is present
+        if not cfg.get('ui_url'):
+            # Best-effort: choose current LAN IP and default port
+            try:
+                import socket
+                hostname = socket.gethostname()
+                lan_ip = socket.gethostbyname(hostname)
+                cfg['ui_url'] = f'http://{lan_ip}:8091'
+            except Exception:
+                pass
+        if requested and not was_open:
+            self._ufw_allow_8091_lan()
+            cfg['ui_open'] = True
+            import time
+            cfg['ui_expires_at'] = time.time() + 12 * 3600
+        elif not requested and was_open:
+            self._ufw_deny_8091_lan()
+            cfg['ui_open'] = False
+            cfg.pop('ui_expires_at', None)
+        obj.config = cfg
+        if commit:
+            obj.save()
+        return obj
+
+    def _ufw_allow_8091_lan(self):
+        try:
+            import subprocess, ipaddress, socket, fcntl, struct
+            # Allow from RFC1918 ranges by default; hubs are LAN only
+            for cidr in ('192.168.0.0/16', '10.0.0.0/8', '172.16.0.0/12'):
+                subprocess.run(['ufw', 'allow', 'from', cidr, 'to', 'any', 'port', '8091'], check=False)
+        except Exception:
+            pass
+
+    def _ufw_deny_8091_lan(self):
+        try:
+            import subprocess
+            # delete rules for default private ranges
+            for cidr in ('192.168.0.0/16', '10.0.0.0/8', '172.16.0.0/12'):
+                subprocess.run(['ufw', 'delete', 'allow', 'from', cidr, 'to', 'any', 'port', '8091'], check=False)
+        except Exception:
+            pass
 
 
 class AdminNodeValueInlineForm(forms.ModelForm):

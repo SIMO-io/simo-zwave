@@ -29,8 +29,8 @@ What you get (at a glance)
 Requirements
 ------------
 
-* SIMO.io core ``>= 1.5.9`` (installed on your hub).
-* Python ``>= 3.8``.
+* SIMO.io core ``>= 3.1.7`` (installed on your hub).
+* Python ``>= 3.12``.
 * USB Z‑Wave controller attached to the hub (e.g., ``/dev/ttyACM0`` or
   ``/dev/ttyUSB0``) with appropriate OS permissions.
 * The hub can create and write to its OpenZWave config paths

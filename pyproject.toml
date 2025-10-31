@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simo-zwave"
-version = "1.0.11"
+version = "2.0.1"
 authors = [
   { name="Simon V.", email="simon@simo.io" },
 ]
-description = "OpenZwave integration for SIMO.io"
+description = "Z-Wave JS integration for SIMO.io"
 readme = "README.md"
 requires-python = ">=3.8"
 classifiers = [

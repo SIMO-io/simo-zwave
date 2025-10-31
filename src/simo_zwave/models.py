@@ -76,6 +76,11 @@ class NodeValue(models.Model):
         Component, on_delete=models.SET_NULL,
         null=True, blank=True, related_name='zwave_node_val'
     )
+    # Z-Wave JS addressing
+    command_class = models.IntegerField(null=True, blank=True, db_index=True)
+    endpoint = models.IntegerField(null=True, blank=True, db_index=True)
+    property = models.CharField(max_length=120, null=True, blank=True)
+    property_key = models.CharField(max_length=120, null=True, blank=True)
 
     class Meta:
         unique_together = 'node', 'value_id'
@@ -111,7 +116,6 @@ def update_zwave_library_on_new_zwave_gateway(
     if not created:
         return
     from .gateways import ZwaveGatewayHandler
-    if instance.type == ZwaveGatewayHandler.uid and 'test' not in sys.argv:
-        from .utils import get_latest_ozw_library
-        get_latest_ozw_library()
-
+    # No-op in Z-Wave JS rewrite; OpenZWave config handling removed
+    if instance.type == ZwaveGatewayHandler.uid:
+        return
