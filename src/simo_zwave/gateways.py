@@ -267,40 +267,64 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 'command': 'node.get_defined_value_ids',
                 'nodeId': nv.node.node_id,
             })
-            items = resp or []
         except Exception:
             return None
 
-        def score(item: Dict[str, Any]) -> int:
+        items = resp
+        if isinstance(resp, dict):
+            items = resp.get('valueIds') or resp.get('result') or []
+        if not isinstance(items, list):
+            return None
+
+        def getf(item, key, fallback=None):
+            if isinstance(item, dict):
+                return item.get(key, fallback)
+            # try attribute style
+            attr = key
+            # translate camelCase to snake_case for common fields
+            trans = {
+                'commandClass': 'command_class',
+                'propertyKey': 'property_key',
+                'propertyName': 'property_name',
+            }
+            attr = trans.get(key, key)
+            return getattr(item, attr, fallback)
+
+        def score(item) -> int:
             s = 0
-            if item.get('commandClass') == nv.command_class:
+            if getf(item, 'commandClass') == nv.command_class:
                 s += 5
-            if (item.get('endpoint') or 0) == (nv.endpoint or 0):
+            if (getf(item, 'endpoint') or 0) == (nv.endpoint or 0):
                 s += 3
-            prop = item.get('property')
-            pname = item.get('propertyName')
-            # Switches: prefer targetValue
+            prop = getf(item, 'property')
+            pname = getf(item, 'propertyName')
             if nv.command_class in (37, 38) and prop == 'targetValue':
                 s += 5
             if prop == nv.property or pname == nv.property:
                 s += 2
-            if nv.property_key is not None and nv.property_key != '' and item.get('propertyKey') == nv.property_key:
+            if nv.property_key not in (None, '') and getf(item, 'propertyKey') == nv.property_key:
                 s += 1
             if pname and nv.label and str(pname).lower() == str(nv.label).lower():
                 s += 1
+            # writable preference
+            meta = getf(item, 'metadata') or {}
+            if isinstance(meta, dict) and meta.get('writeable'):
+                s += 1
             return s
 
-        if not items:
+        candidates = [i for i in items if isinstance(i, (dict, object))]
+        if not candidates:
             return None
-        items = sorted(items, key=score, reverse=True)
-        best = items[0]
+        candidates.sort(key=score, reverse=True)
+        best = candidates[0]
         vid = {
-            'commandClass': best.get('commandClass'),
-            'endpoint': best.get('endpoint') or 0,
-            'property': best.get('property'),
+            'commandClass': getf(best, 'commandClass'),
+            'endpoint': getf(best, 'endpoint') or 0,
+            'property': getf(best, 'property'),
         }
-        if best.get('propertyKey') is not None:
-            vid['propertyKey'] = best.get('propertyKey')
+        pk = getf(best, 'propertyKey')
+        if pk is not None:
+            vid['propertyKey'] = pk
         return vid
 
     async def _set_value(self, node_val: NodeValue, value):
