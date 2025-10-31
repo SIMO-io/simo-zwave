@@ -1061,29 +1061,53 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         # bound binary sensor exists for this endpoint, use it regardless of property name.
         if not nv and cc == 48:
             try:
-                bound = NodeValue.objects.filter(
+                candidates = list(NodeValue.objects.filter(
                     node=zn, command_class=48, endpoint=endpoint, component__isnull=False
-                )
-                if bound.count() == 1:
-                    nv = bound.first()
+                ))
+                if len(candidates) == 1:
+                    nv = candidates[0]
+                elif len(candidates) > 1:
+                    # Prefer property exact match, then labels that include 'motion'
+                    prop_norm = str(prop).strip().lower() if prop is not None else ''
+                    prefer = [c for c in candidates if (c.property or '').strip().lower() == prop_norm]
+                    if len(prefer) == 1:
+                        nv = prefer[0]
+                    else:
+                        prefer = [c for c in candidates if 'motion' in ((c.label or '') + ' ' + (c.name or '')).lower()]
+                        if len(prefer) == 1:
+                            nv = prefer[0]
+                        else:
+                            nv = candidates[0]
+                    try:
+                        self.logger.info(f"CC48 fallback mapped to NV pk={nv.pk} comp={nv.component_id} for node={zn.node_id} ep={endpoint} prop={prop}")
+                    except Exception:
+                        pass
             except Exception:
                 nv = None
         # Basic CC (32) can reflect binary state; map to a single bound CC48 if present
         if not nv and cc == 32 and str(prop) == 'currentValue':
             try:
                 # prefer a single bound CC48 at same endpoint
-                bound48 = NodeValue.objects.filter(
+                bound48 = list(NodeValue.objects.filter(
                     node=zn, command_class=48, endpoint=endpoint, component__isnull=False
-                )
-                if bound48.count() == 1:
-                    nv = bound48.first()
+                ))
+                if len(bound48) == 1:
+                    nv = bound48[0]
+                    try:
+                        self.logger.info(f"Basic->CC48 mapped to NV pk={nv.pk} comp={nv.component_id} for node={zn.node_id} ep={endpoint}")
+                    except Exception:
+                        pass
                 else:
                     # fallback to CC32 bound row if exactly one at this endpoint
-                    bound32 = NodeValue.objects.filter(
+                    bound32 = list(NodeValue.objects.filter(
                         node=zn, command_class=32, endpoint=endpoint, component__isnull=False
-                    )
-                    if bound32.count() == 1:
-                        nv = bound32.first()
+                    ))
+                    if len(bound32) == 1:
+                        nv = bound32[0]
+                        try:
+                            self.logger.info(f"Basic->CC32 mapped to NV pk={nv.pk} comp={nv.component_id} for node={zn.node_id} ep={endpoint}")
+                        except Exception:
+                            pass
             except Exception:
                 nv = None
         # Fallback to label/name matching
@@ -1146,6 +1170,18 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 self.logger.info(f"Import map node={zn.node_id} '{label}' -> NV pk={nv.pk} cc={cc} ep={endpoint} prop={prop} key={prop_key} created=True")
         except Exception:
             pass
+        # Push to component if linked (normalize binary values for CC48/Basic mapping)
+        if nv.component:
+            try:
+                out_val = nv.value
+                if cc in (48,) and isinstance(out_val, (int, float)):
+                    out_val = bool(int(out_val))
+                nv.component.controller._receive_from_device(out_val, is_alive=zn.alive)
+            except Exception:
+                self.logger.error(
+                    f"Failed to set component value comp={getattr(nv.component,'id',None)} node={zn.node_id} cc={cc} ep={endpoint} prop={prop} key={prop_key} val={nv.value}",
+                    exc_info=True,
+                )
         # Battery level shortcut
         if cc == 0x80 and current is not None:
             try:
