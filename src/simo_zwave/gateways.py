@@ -461,6 +461,30 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 'label': node_val.label,
                 'nv_pk': node_val.pk,
             }
+            # Skip redundant sends to avoid feedback loops and spamming the network
+            try:
+                cc = addr.get('cc')
+                desired = value
+                if cc == 38:
+                    if isinstance(desired, bool):
+                        desired = 99 if desired else 0
+                    if isinstance(desired, (int, float)):
+                        desired = max(0, min(int(desired), 99))
+                elif cc == 37:
+                    if isinstance(desired, (int, float)):
+                        desired = bool(desired)
+                current = node_val.value
+                if cc == 37:
+                    cur_bool = bool(current) if current is not None else None
+                    if cur_bool is not None and cur_bool == bool(desired):
+                        self.logger.info(f"Skip duplicate send for comp={component.id}; already at {cur_bool}")
+                        return
+                elif cc == 38 and isinstance(desired, int) and isinstance(current, (int, float)):
+                    if int(current) == int(desired):
+                        self.logger.info(f"Skip duplicate send for comp={component.id}; already at {int(current)}")
+                        return
+            except Exception:
+                pass
             if not addr['cc']:
                 from django.db.models import Q
                 alt = NodeValue.objects.filter(node_id=node_val.node_id).filter(
