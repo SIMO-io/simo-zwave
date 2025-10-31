@@ -1033,6 +1033,35 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 node=zn, command_class=cc, endpoint=endpoint, property='targetValue'
             )
             nv = alt_qs.filter(component__isnull=False).first() or alt_qs.first()
+        # Binary Sensor (CC 48) special-case: if addressing didn't match, but exactly one
+        # bound binary sensor exists for this endpoint, use it regardless of property name.
+        if not nv and cc == 48:
+            try:
+                bound = NodeValue.objects.filter(
+                    node=zn, command_class=48, endpoint=endpoint, component__isnull=False
+                )
+                if bound.count() == 1:
+                    nv = bound.first()
+            except Exception:
+                nv = None
+        # Basic CC (32) can reflect binary state; map to a single bound CC48 if present
+        if not nv and cc == 32 and str(prop) == 'currentValue':
+            try:
+                # prefer a single bound CC48 at same endpoint
+                bound48 = NodeValue.objects.filter(
+                    node=zn, command_class=48, endpoint=endpoint, component__isnull=False
+                )
+                if bound48.count() == 1:
+                    nv = bound48.first()
+                else:
+                    # fallback to CC32 bound row if exactly one at this endpoint
+                    bound32 = NodeValue.objects.filter(
+                        node=zn, command_class=32, endpoint=endpoint, component__isnull=False
+                    )
+                    if bound32.count() == 1:
+                        nv = bound32.first()
+            except Exception:
+                nv = None
         # Fallback to label/name matching
         base_qs = NodeValue.objects.filter(node=zn).filter(Q(name__iexact=label) | Q(label__iexact=label))
         try:
