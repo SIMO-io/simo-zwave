@@ -38,6 +38,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
     # --------------- Lifecycle ---------------
     def run(self, exit):
         self.exit = exit
+        try:
+            self.logger = get_gw_logger(self.gateway_instance.id)
+        except Exception:
+            pass
         # Start WS thread immediately to avoid early send attempts failing
         self._start_ws_thread()
         # Start MQTT command listener (BaseObjectCommandsGatewayHandler)
@@ -64,13 +68,25 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 import aiohttp
                 session = aiohttp.ClientSession()
                 self._client = ZJSClient(self._ws_url, session)
+                try:
+                    self.logger.info(f"Connecting WS {self._ws_url}")
+                except Exception:
+                    pass
                 await self._client.connect()
                 self._connected = True
                 backoff = 1
+                try:
+                    self.logger.info("WS connected; waiting for driver ready")
+                except Exception:
+                    pass
                 # Start listening and wait until driver is ready
                 driver_ready = asyncio.Event()
                 listen_task = asyncio.create_task(self._client.listen(driver_ready))
                 await driver_ready.wait()
+                try:
+                    self.logger.info("Driver ready; importing full state")
+                except Exception:
+                    pass
                 # Import full state from driver model
                 await self._import_driver_state()
                 # Keep task running until closed
@@ -114,6 +130,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         # Periodically import current driver state into DB so values remain fresh
         try:
             if self._client and self._client.connected:
+                try:
+                    self.logger.info("Sync tick: importing state")
+                except Exception:
+                    pass
                 self._async_call(self._import_driver_state())
         except Exception:
             pass
@@ -145,6 +165,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 return
             for nv in pending:
                 try:
+                    try:
+                        self.logger.info(f"Migrating NV pk={nv.pk} comp={nv.component_id} base_type={nv.component.base_type}")
+                    except Exception:
+                        pass
                     self._migrate_one_legacy(nv)
                 except Exception:
                     continue
@@ -233,12 +257,14 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             except Exception:
                 pass
             return
-        node_val = NodeValue.objects.filter(
-            pk=component.config.get('zwave_item')
-        ).first()
+        node_val = NodeValue.objects.filter(pk=component.config.get('zwave_item')).first()
         if not node_val:
             return
         try:
+            try:
+                self.logger.info(f"Send comp={component.id} '{component.name}' nv={node_val.pk} raw={value}")
+            except Exception:
+                pass
             # Attempt to coerce string values
             if isinstance(value, str):
                 if value.lower() in ('true', 'on'):
@@ -250,16 +276,27 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         value = float(value) if '.' in value else int(value)
                     except Exception:
                         pass
-            # If addressing is missing (legacy rows), try to find a sibling with addressing
-            nv = node_val
-            if not nv.command_class:
+            addr = {
+                'node_id': node_val.node_id,
+                'cc': node_val.command_class,
+                'endpoint': node_val.endpoint or 0,
+                'property': node_val.property,
+                'property_key': node_val.property_key,
+                'label': node_val.label,
+                'nv_pk': node_val.pk,
+            }
+            if not addr['cc']:
                 from django.db.models import Q
-                alt = NodeValue.objects.filter(node=nv.node).filter(
-                    Q(name__iexact=nv.name) | Q(label__iexact=nv.label)
-                ).exclude(pk=nv.pk).first()
+                alt = NodeValue.objects.filter(node_id=node_val.node_id).filter(
+                    Q(name__iexact=node_val.name) | Q(label__iexact=node_val.label)
+                ).exclude(pk=node_val.pk).first()
                 if alt and alt.command_class:
-                    nv = alt
-            self._async_call(self._set_value(nv, value))
+                    addr.update({'cc': alt.command_class, 'endpoint': alt.endpoint or 0, 'property': alt.property, 'property_key': alt.property_key})
+            try:
+                self.logger.info(f"Addr node={addr['node_id']} cc={addr['cc']} ep={addr['endpoint']} prop={addr['property']} key={addr['property_key']}")
+            except Exception:
+                pass
+            self._async_call(self._set_value(addr, value))
         except Exception as e:
             self.logger.error(f"Send error: {e}", exc_info=True)
 
@@ -359,7 +396,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             vid['propertyKey'] = _coerce(pk)
         return vid
 
-    async def _resolve_value_id_async(self, nv: NodeValue, desired_value: Any = None) -> Optional[Dict[str, Any]]:
+    async def _resolve_value_id_async(self, node_id: int, cc: Optional[int], endpoint: Optional[int], prop: Optional[Any], prop_key: Optional[Any], label: Optional[str], desired_value: Any = None) -> Optional[Dict[str, Any]]:
         """Ask server for defined value IDs and pick the best writable match.
 
         Strategy:
@@ -369,10 +406,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         Returns a valueId dict or None.
         """
         try:
-            resp = await self._client.async_send_command({
-                'command': 'node.get_defined_value_ids',
-                'nodeId': nv.node.node_id,
-            })
+            resp = await self._client.async_send_command({'command': 'node.get_defined_value_ids', 'nodeId': node_id})
         except Exception:
             return None
 
@@ -407,11 +441,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 pk = getf(item, 'propertyKey')
                 if pk is not None:
                     val_id['propertyKey'] = pk
-                meta_resp = await self._client.async_send_command({
-                    'command': 'node.get_value_metadata',
-                    'nodeId': nv.node.node_id,
-                    'valueId': val_id,
-                })
+                meta_resp = await self._client.async_send_command({'command': 'node.get_value_metadata', 'nodeId': node_id, 'valueId': val_id})
                 if isinstance(meta_resp, dict):
                     # Some servers may return directly, others nested
                     md = meta_resp.get('metadata') or meta_resp.get('result') or meta_resp
@@ -430,7 +460,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
 
         # Preload metadata for candidates with matching CC/endpoint only (limit scope)
         meta_cache: Dict[int, Dict[str, Any]] = {}
-        filtered = [i for i in items if getf(i, 'commandClass') == nv.command_class and (getf(i, 'endpoint') or 0) == (nv.endpoint or 0)]
+        filtered = [i for i in items if getf(i, 'commandClass') == cc and (getf(i, 'endpoint') or 0) == (endpoint or 0)]
         if not filtered:
             filtered = items
         # Limit to reasonable number to avoid heavy calls
@@ -445,19 +475,19 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
 
         def score(item) -> int:
             s = 0
-            if getf(item, 'commandClass') == nv.command_class:
+            if getf(item, 'commandClass') == cc:
                 s += 5
-            if (getf(item, 'endpoint') or 0) == (nv.endpoint or 0):
+            if (getf(item, 'endpoint') or 0) == (endpoint or 0):
                 s += 3
-            prop = getf(item, 'property')
+            prop_i = getf(item, 'property')
             pname = getf(item, 'propertyName')
-            if nv.command_class in (37, 38) and prop == 'targetValue':
+            if cc in (37, 38) and prop_i == 'targetValue':
                 s += 5
-            if prop == nv.property or pname == nv.property:
+            if (prop is not None and prop_i == prop) or (prop is not None and pname == prop):
                 s += 2
-            if nv.property_key not in (None, '') and getf(item, 'propertyKey') == nv.property_key:
+            if prop_key not in (None, '') and getf(item, 'propertyKey') == prop_key:
                 s += 1
-            if pname and nv.label and str(pname).lower() == str(nv.label).lower():
+            if pname and label and str(pname).lower() == str(label).lower():
                 s += 1
             # writable preference
             meta = meta_cache.get(id(item), {})
@@ -471,10 +501,6 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         candidates = [i for i in items if isinstance(i, (dict, object))]
         if not candidates:
             return None
-        # Prefer writable candidates if available
-        writable_candidates = [i for i in candidates if isinstance(meta_cache.get(id(i), {}), dict) and meta_cache.get(id(i), {}).get('writeable')]
-        if writable_candidates:
-            candidates = writable_candidates
         candidates.sort(key=score, reverse=True)
         best = candidates[0]
         vid = {
@@ -487,27 +513,34 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             vid['propertyKey'] = pk
         return vid
 
-    async def _set_value(self, node_val: NodeValue, value):
+    async def _set_value(self, addr: Dict[str, Any], value):
         if not self._client or not self._client.connected:
             raise RuntimeError('Z-Wave JS not connected')
-        # Normalize value for specific CCs
+        node_id = addr['node_id']
+        cc = addr.get('cc')
+        endpoint = addr.get('endpoint') or 0
+        prop = addr.get('property')
+        prop_key = addr.get('property_key')
+        label = addr.get('label')
+        nv_pk = addr.get('nv_pk')
         try:
-            if node_val.command_class == 38:  # Multilevel Switch
+            if cc == 38:
                 if isinstance(value, bool):
                     value = 99 if value else 0
                 if isinstance(value, (int, float)):
                     value = max(0, min(int(value), 99))
-            elif node_val.command_class == 37:  # Binary Switch
+            elif cc == 37:
                 if isinstance(value, (int, float)):
                     value = bool(value)
         except Exception:
             pass
-        # Prefer modern API: node.set_value
-        value_id = self._build_value_id(node_val)
+        class _NV: pass
+        nv_like = _NV(); nv_like.command_class=cc; nv_like.endpoint=endpoint; nv_like.property=prop; nv_like.property_key=prop_key
+        value_id = self._build_value_id(nv_like)
         try:
             await self._client.async_send_command({
                 'command': 'node.set_value',
-                'nodeId': node_val.node.node_id,
+                'nodeId': node_id,
                 'valueId': value_id,
                 'value': value,
             })
@@ -515,32 +548,36 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             # Try to resolve to a valid valueId if invalid, then retry once
             msg = str(e)
             if 'Invalid ValueID' in msg or 'ZW0322' in msg or 'zwave_error' in msg:
-                resolved = await self._resolve_value_id_async(node_val, value)
+                resolved = await self._resolve_value_id_async(node_id, cc, endpoint, prop, prop_key, label, value)
                 if resolved:
                     await self._client.async_send_command({
                         'command': 'node.set_value',
-                        'nodeId': node_val.node.node_id,
+                        'nodeId': node_id,
                         'valueId': resolved,
                         'value': value,
                     })
                     # Persist resolved addressing for future sends
                     try:
-                        node_val.command_class = resolved.get('commandClass')
-                        node_val.endpoint = resolved.get('endpoint') or 0
-                        node_val.property = resolved.get('property')
-                        node_val.property_key = resolved.get('propertyKey')
-                        node_val.save(update_fields=['command_class', 'endpoint', 'property', 'property_key'])
+                        def _persist(pk, res):
+                            from simo_zwave.models import NodeValue as NV
+                            NV.objects.filter(pk=pk).update(
+                                command_class=res.get('commandClass'),
+                                endpoint=res.get('endpoint') or 0,
+                                property=res.get('property'),
+                                property_key=res.get('propertyKey'),
+                            )
+                        await asyncio.to_thread(_persist, nv_pk, resolved)
                     except Exception:
                         pass
                     return
                 # As a last resort for switches, call CC API directly
                 try:
-                    if node_val.command_class in (37, 38):
+                    if cc in (37, 38):
                         await self._client.async_send_command({
                             'command': 'endpoint.invoke_cc_api',
-                            'nodeId': node_val.node.node_id,
-                            'endpoint': node_val.endpoint or 0,
-                            'commandClass': node_val.command_class,
+                            'nodeId': node_id,
+                            'endpoint': endpoint,
+                            'commandClass': cc,
                             'methodName': 'set',
                             'args': [value],
                         })
