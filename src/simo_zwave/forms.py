@@ -34,7 +34,10 @@ class ZwaveGatewayForm(BaseGatewayForm):
         # fill readonly fields from gateway config
         cfg = self.instance.config or {}
         # UI URL best-effort compute
-        self.fields['ui_url'].initial = cfg.get('ui_url') or self._compute_ui_url()
+        computed = cfg.get('ui_url') or self._compute_ui_url()
+        # Set both field initial and form initial to ensure widget gets a value
+        self.fields['ui_url'].initial = computed
+        self.initial['ui_url'] = computed
         expires_at = cfg.get('ui_expires_at')
         if expires_at:
             try:
@@ -45,6 +48,11 @@ class ZwaveGatewayForm(BaseGatewayForm):
                 pass
         # reflect current exposure status
         self.fields['expose_ui'].initial = bool(cfg.get('ui_open', False))
+        # Avoid persisting helper/display fields in config
+        if hasattr(self, 'config_fields'):
+            for helper_field in ('ui_url', 'expose_ui'):
+                if helper_field in self.config_fields:
+                    self.config_fields.remove(helper_field)
 
     def save(self, commit=True):
         obj = super().save(commit=False)

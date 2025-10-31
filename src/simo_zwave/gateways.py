@@ -263,6 +263,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 values = []
                 for v in getattr(node, 'values', {}).values():
                     try:
+                        meta = getattr(v, 'metadata', None)
                         values.append({
                             'commandClass': getattr(v, 'command_class', None),
                             'endpoint': getattr(v, 'endpoint', 0) or 0,
@@ -270,7 +271,13 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                             'propertyKey': getattr(v, 'property_key', None),
                             'propertyName': getattr(v, 'property_name', None),
                             'value': getattr(v, 'value', None),
-                            'metadata': getattr(v, 'metadata', {}) or {},
+                            'metadata': {
+                                'label': getattr(meta, 'label', None),
+                                'unit': getattr(meta, 'unit', ''),
+                                'writeable': getattr(meta, 'writeable', False),
+                                'type': getattr(meta, 'type', ''),
+                                'states': getattr(meta, 'states', None) or [],
+                            },
                         })
                     except Exception:
                         continue

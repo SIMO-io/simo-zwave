@@ -35,17 +35,14 @@ Install Z‑Wave JS UI (Snap)
 
 .. code-block:: bash
 
-   sudo snap install zwave-js-ui
-   sudo snap connect zwave-js-ui:raw-usb
-   sudo snap connect zwave-js-ui:hardware-observe
-   # Start the service now
-   sudo snap start zwave-js-ui
-   # Enable autostart on boot
-   sudo snap enable zwave-js-ui
+   snap install zwave-js-ui
+   snap connect zwave-js-ui:raw-usb
+   snap connect zwave-js-ui:hardware-observe
+   snap start --enable zwave-js-ui
    # Verify status
-   sudo snap services zwave-js-ui
+   snap services zwave-js-ui
    # Tail logs if needed
-   sudo snap logs zwave-js-ui --follow
+   snap logs zwave-js-ui --follow
 
 Z‑Wave JS UI access (from SIMO Admin)
 -------------------------------------
