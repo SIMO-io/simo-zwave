@@ -133,6 +133,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             try:
                 node.on('value updated', lambda event, n=node: self._on_value_event(event))
                 node.on('value added', lambda event, n=node: self._on_value_event(event))
+                node.on('dead', lambda event, n=node: self._on_node_status_event(event))
+                node.on('alive', lambda event, n=node: self._on_node_status_event(event))
+                node.on('sleep', lambda event, n=node: self._on_node_status_event(event))
+                node.on('wake up', lambda event, n=node: self._on_node_status_event(event))
             except Exception:
                 continue
 
@@ -176,10 +180,44 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 'nodeId': node.node_id,
                 'name': getattr(node, 'name', '') or '',
                 'productLabel': getattr(node, 'product_label', '') or '',
+                'status': getattr(node, 'status', None),
                 'values': [val],
             }
             import asyncio as _asyncio
             _asyncio.run_coroutine_threadsafe(self._import_node_async(state), self._loop)
+        except Exception:
+            pass
+
+    def _on_node_status_event(self, event):
+        try:
+            node = event.get('node')
+            if not node:
+                return
+            etype = str(event.get('type') or '')
+            is_alive = etype != 'dead'
+            # Update ZwaveNode.alive
+            from .models import ZwaveNode as ZN, NodeValue as NV
+            zn = ZN.objects.filter(gateway=self.gateway_instance, node_id=getattr(node, 'node_id', None)).first()
+            if not zn:
+                return
+            if zn.alive != is_alive:
+                zn.alive = is_alive
+                zn.save(update_fields=['alive'])
+            # Propagate availability to all components bound to this node
+            try:
+                # Fetch distinct components connected to this node
+                comps = [nv.component for nv in NV.objects.filter(node=zn, component__isnull=False).select_related('component')]
+                seen = set()
+                for comp in comps:
+                    if not comp or comp.id in seen:
+                        continue
+                    seen.add(comp.id)
+                    try:
+                        comp.controller._receive_from_device(comp.value, is_alive=is_alive)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -329,6 +367,20 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         node_val = NodeValue.objects.filter(pk=component.config.get('zwave_item')).first()
         if not node_val:
             return
+        # If node is marked dead, skip the send and reflect availability
+        try:
+            if hasattr(node_val, 'node') and node_val.node and node_val.node.alive is False:
+                try:
+                    self.logger.info(f"Node {node_val.node.node_id} is dead; skipping send for comp={component.id}")
+                except Exception:
+                    pass
+                try:
+                    component.controller._receive_from_device(component.value, is_alive=False)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
         try:
             try:
                 self.logger.info(f"Send comp={component.id} '{component.name}' nv={node_val.pk} raw={value}")
@@ -807,6 +859,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     'nodeId': node.node_id,
                     'name': getattr(node, 'name', '') or '',
                     'productLabel': getattr(node, 'product_label', '') or '',
+                    'status': getattr(node, 'status', None),
                     'values': values,
                 }
                 # Run ORM imports in thread to avoid async DB access
@@ -827,8 +880,29 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         )
         if name and zn.name != name:
             zn.name = name
-        zn.alive = True
+        status = node_state.get('status')
+        # 3 == DEAD in zwave_js_server.const.NodeStatus
+        zn.alive = False if status == 3 else True
         zn.save()
+        try:
+            key_alive = f"node:{node_id}:alive"
+            prev_alive = self._last_state.get(key_alive)
+            if prev_alive is None or bool(prev_alive) != bool(zn.alive):
+                self._last_state[key_alive] = bool(zn.alive)
+                # Propagate availability to components bound to this node
+                from .models import NodeValue as NV
+                comps = [nv2.component for nv2 in NV.objects.filter(node=zn, component__isnull=False).select_related('component')]
+                seen = set()
+                for comp in comps:
+                    if not comp or comp.id in seen:
+                        continue
+                    seen.add(comp.id)
+                    try:
+                        comp.controller._receive_from_device(comp.value, is_alive=zn.alive)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
         # Log node import summary only when value count changes
         try:
             vcount = len(node_state.get('values') or [])
@@ -949,14 +1023,32 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         except Exception:
             pass
         # Battery level shortcut
-        if cc == 0x80 and units == '%':
-            zn.battery_level = current
-            zn.save(update_fields=['battery_level'])
+        if cc == 0x80 and units == '%' and current is not None:
+            try:
+                zn.battery_level = current
+                zn.save(update_fields=['battery_level'])
+            except Exception:
+                pass
+            # Update battery level across all components bound to this node without changing their values
+            try:
+                from .models import NodeValue as NV
+                comps = [nv2.component for nv2 in NV.objects.filter(node=zn, component__isnull=False).select_related('component')]
+                seen = set()
+                for comp in comps:
+                    if not comp or comp.id in seen:
+                        continue
+                    seen.add(comp.id)
+                    try:
+                        comp.controller._receive_from_device(comp.value, is_alive=zn.alive, battery_level=current)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
         # Push to component if linked
         if nv.component:
             try:
                 if nv.value is not None:
-                    nv.component.controller._receive_from_device(nv.value)
+                    nv.component.controller._receive_from_device(nv.value, is_alive=zn.alive)
             except Exception:
                 # Lower verbosity; skip noisy stack traces here
                 self.logger.info("Failed to set component value (ignored)")
