@@ -17,14 +17,6 @@ from .widgets import AdminNodeValueValueWidget, AdminNodeValueSelectWidget
 
 
 class ZwaveGatewayForm(BaseGatewayForm):
-    ws_host = forms.CharField(
-        label=_('WS Host'), initial='127.0.0.1',
-        help_text=_('Host where Z-Wave JS Server (WS) listens. Keep 127.0.0.1.')
-    )
-    ws_port = forms.IntegerField(
-        label=_('WS Port'), initial=3000,
-        help_text=_('Port for Z-Wave JS Server WS.')
-    )
     expose_ui = forms.BooleanField(
         label=_('Expose Z-Wave JS UI on LAN for 12 hours'), required=False
     )
@@ -41,11 +33,6 @@ class ZwaveGatewayForm(BaseGatewayForm):
         super().__init__(*args, **kwargs)
         # fill readonly fields from gateway config
         cfg = self.instance.config or {}
-        # WS config
-        if cfg.get('ws_host'):
-            self.fields['ws_host'].initial = cfg.get('ws_host')
-        if cfg.get('ws_port'):
-            self.fields['ws_port'].initial = cfg.get('ws_port')
         # UI URL best-effort compute
         self.fields['ui_url'].initial = cfg.get('ui_url') or self._compute_ui_url()
         expires_at = cfg.get('ui_expires_at')
@@ -62,9 +49,6 @@ class ZwaveGatewayForm(BaseGatewayForm):
     def save(self, commit=True):
         obj = super().save(commit=False)
         cfg = obj.config or {}
-        # Save WS config
-        cfg['ws_host'] = self.cleaned_data.get('ws_host') or '127.0.0.1'
-        cfg['ws_port'] = int(self.cleaned_data.get('ws_port') or 3000)
         requested = self.cleaned_data.get('expose_ui', False)
         was_open = bool(cfg.get('ui_open', False))
         # ensure URL is present
@@ -85,19 +69,11 @@ class ZwaveGatewayForm(BaseGatewayForm):
         return obj
 
     def _compute_ui_url(self):
-        # Determine LAN IP via UDP trick
         try:
-            import socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(0)
-            try:
-                s.connect(('8.8.8.8', 80))
-                ip = s.getsockname()[0]
-            except Exception:
-                ip = socket.gethostbyname(socket.gethostname())
-            finally:
-                s.close()
-            return f'http://{ip}:8091'
+            from simo.core.utils.helpers import get_self_ip
+            ip = get_self_ip()
+            url = f'http://{ip}:8091'
+            return f'<a href="{url}" target="_blank" rel="noopener">{url}</a>'
         except Exception:
             return ''
 

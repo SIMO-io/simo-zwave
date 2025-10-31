@@ -120,6 +120,13 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
 
     # --------------- MQTT commands ---------------
     def perform_value_send(self, component, value):
+        # If WS is not connected yet, skip with a concise log
+        if not self._client or not self._client.connected:
+            try:
+                self.logger.info("WS not connected; skipping send")
+            except Exception:
+                pass
+            return
         node_val = NodeValue.objects.filter(
             pk=component.config.get('zwave_item')
         ).first()
@@ -253,28 +260,33 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         for node in nodes:
             try:
                 # Build a pseudo state dict for import
+                values = []
+                for v in getattr(node, 'values', {}).values():
+                    try:
+                        values.append({
+                            'commandClass': getattr(v, 'command_class', None),
+                            'endpoint': getattr(v, 'endpoint', 0) or 0,
+                            'property': getattr(v, 'property_', None),
+                            'propertyKey': getattr(v, 'property_key', None),
+                            'propertyName': getattr(v, 'property_name', None),
+                            'value': getattr(v, 'value', None),
+                            'metadata': getattr(v, 'metadata', {}) or {},
+                        })
+                    except Exception:
+                        continue
                 state = {
                     'nodeId': node.node_id,
                     'name': getattr(node, 'name', '') or '',
                     'productLabel': getattr(node, 'product_label', '') or '',
-                    'values': [
-                        {
-                            'commandClass': v.command_class,
-                            'endpoint': v.endpoint,
-                            'property': v.property,
-                            'propertyKey': v.property_key,
-                            'propertyName': getattr(v, 'property_name', None),
-                            'value': v.value,
-                            'metadata': getattr(v, 'metadata', {}) or {},
-                        }
-                        for v in getattr(node, 'values', {}).values()
-                    ],
+                    'values': values,
                 }
-                await self._import_node(state)
+                # Run ORM imports in thread to avoid async DB access
+                import asyncio as _asyncio
+                await _asyncio.to_thread(self._import_node_sync, state)
             except Exception:
                 self.logger.error("Failed to import node state", exc_info=True)
 
-    async def _import_node(self, node_state: Dict[str, Any]):
+    def _import_node_sync(self, node_state: Dict[str, Any]):
         node_id = node_state.get('nodeId') or node_state.get('id')
         if not node_id:
             return

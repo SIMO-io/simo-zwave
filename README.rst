@@ -38,6 +38,14 @@ Install Z‑Wave JS UI (Snap)
    sudo snap install zwave-js-ui
    sudo snap connect zwave-js-ui:raw-usb
    sudo snap connect zwave-js-ui:hardware-observe
+   # Start the service now
+   sudo snap start zwave-js-ui
+   # Enable autostart on boot
+   sudo snap enable zwave-js-ui
+   # Verify status
+   sudo snap services zwave-js-ui
+   # Tail logs if needed
+   sudo snap logs zwave-js-ui --follow
 
 Z‑Wave JS UI access (from SIMO Admin)
 -------------------------------------
@@ -53,7 +61,7 @@ Then in the Z‑Wave JS UI, set:
 * Settings → Z‑Wave → Serial Port: select ``/dev/serial/by-id/...`` for your stick.
 * Settings → Z‑Wave → Security Keys: define S0 and S2 keys; keep a backup.
 * Settings → Home Assistant → WS Server: enable, Host ``127.0.0.1``, Port ``3000`` (loopback only).
-* Settings → MQTT Gateway: disable (not required by SIMO).
+* Settings → MQTT Gateway: disable (not required by SIMO.io).
 
 Install this integration
 ------------------------
