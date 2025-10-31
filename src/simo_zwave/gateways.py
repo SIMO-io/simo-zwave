@@ -253,7 +253,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             vid['propertyKey'] = _coerce(pk)
         return vid
 
-    async def _resolve_value_id_async(self, nv: NodeValue) -> Optional[Dict[str, Any]]:
+    async def _resolve_value_id_async(self, nv: NodeValue, desired_value: Any = None) -> Optional[Dict[str, Any]]:
         """Ask server for defined value IDs and pick the best writable match.
 
         Strategy:
@@ -290,6 +290,53 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             attr = trans.get(key, key)
             return getattr(item, attr, fallback)
 
+        # Optionally fetch metadata for scoring
+        async def get_meta(item) -> Dict[str, Any]:
+            try:
+                val_id = {
+                    'commandClass': getf(item, 'commandClass'),
+                    'endpoint': getf(item, 'endpoint') or 0,
+                    'property': getf(item, 'property'),
+                }
+                pk = getf(item, 'propertyKey')
+                if pk is not None:
+                    val_id['propertyKey'] = pk
+                meta_resp = await self._client.async_send_command({
+                    'command': 'node.get_value_metadata',
+                    'nodeId': nv.node.node_id,
+                    'valueId': val_id,
+                })
+                if isinstance(meta_resp, dict):
+                    # Some servers may return directly, others nested
+                    md = meta_resp.get('metadata') or meta_resp.get('result') or meta_resp
+                    if isinstance(md, dict):
+                        return md
+                return {}
+            except Exception:
+                return {}
+
+        # Determine expected type
+        expected_type = None
+        if isinstance(desired_value, bool):
+            expected_type = 'boolean'
+        elif isinstance(desired_value, (int, float)):
+            expected_type = 'number'
+
+        # Preload metadata for candidates with matching CC/endpoint only (limit scope)
+        meta_cache: Dict[int, Dict[str, Any]] = {}
+        filtered = [i for i in items if getf(i, 'commandClass') == nv.command_class and (getf(i, 'endpoint') or 0) == (nv.endpoint or 0)]
+        if not filtered:
+            filtered = items
+        # Limit to reasonable number to avoid heavy calls
+        limited = filtered[:30]
+        # Fetch metadata concurrently
+        try:
+            metas = await asyncio.gather(*[get_meta(i) for i in limited])
+            for idx, md in enumerate(metas):
+                meta_cache[id(limited[idx])] = md
+        except Exception:
+            pass
+
         def score(item) -> int:
             s = 0
             if getf(item, 'commandClass') == nv.command_class:
@@ -307,8 +354,11 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             if pname and nv.label and str(pname).lower() == str(nv.label).lower():
                 s += 1
             # writable preference
-            meta = getf(item, 'metadata') or {}
+            meta = meta_cache.get(id(item), {})
             if isinstance(meta, dict) and meta.get('writeable'):
+                s += 1
+            # expected type preference
+            if expected_type and isinstance(meta, dict) and meta.get('type') == expected_type:
                 s += 1
             return s
 
@@ -343,7 +393,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             # Try to resolve to a valid valueId if invalid, then retry once
             msg = str(e)
             if 'Invalid ValueID' in msg or 'ZW0322' in msg or 'zwave_error' in msg:
-                resolved = await self._resolve_value_id_async(node_val)
+                resolved = await self._resolve_value_id_async(node_val, value)
                 if resolved:
                     await self._client.async_send_command({
                         'command': 'node.set_value',
