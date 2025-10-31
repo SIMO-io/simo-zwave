@@ -24,7 +24,13 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
     name = "Z-Wave JS"
     config_form = ZwaveGatewayForm
     auto_create = True
-    periodic_tasks = (('maintain', 10), ('ufw_expiry_check', 60), ('sync_values', 10), ('migrate_legacy', 5))
+    # Slow down legacy migration to reduce log noise
+    periodic_tasks = (
+        ('maintain', 10),
+        ('ufw_expiry_check', 60),
+        ('sync_values', 10),
+        ('migrate_legacy', 60),
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -181,10 +187,16 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             return
         # Map base_type to CC target and expected write pattern
         base_type = (comp.base_type or '').lower()
-        if base_type in ('switch', 'lock', 'blinds', 'gate', 'rgbw-light'):
+        if base_type in ('switch', 'lock', 'blinds', 'gate'):
             cc = 37  # Binary Switch as default for switch-like
-        elif base_type in ('dimmer',):
+        elif base_type in ('dimmer', 'rgbw-light'):
             cc = 38  # Multilevel Switch
+        elif base_type in ('binary-sensor',):
+            # Resolve any boolean value matching this node/label
+            cc = None
+        elif base_type in ('numeric-sensor',):
+            # Resolve any numeric value matching this node/label
+            cc = None
         else:
             try:
                 self.logger.info(f"Skip migration for NV pk={nv.pk} base_type={base_type}")
@@ -193,14 +205,15 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             return
         # Resolve a writable ValueID using resolver (falls back to driver model)
         try:
+            label = nv.label or (comp.name if comp else None)
             resolved = self._async_call(self._resolve_value_id_async(
-                nv.node.node_id, cc, None, None, None, nv.label or (comp.name if comp else None), desired_value=nv.value
+                nv.node.node_id, cc, None, None, None, label, desired_value=nv.value
             ))
         except Exception:
             resolved = None
         if not resolved:
             try:
-                self.logger.info(f"NV pk={nv.pk} no suitable target found; skipping")
+                self.logger.info(f"NV pk={nv.pk} no suitable target found; skipping (base_type={base_type})")
             except Exception:
                 pass
             return
@@ -212,7 +225,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         nv.save(update_fields=['command_class', 'endpoint', 'property', 'property_key'])
         try:
             self.logger.info(
-                f"Migrated NV pk={nv.pk} to CC={nv.command_class} ep={nv.endpoint} prop={nv.property}"
+                f"Migrated NV pk={nv.pk} to CC={nv.command_class} ep={nv.endpoint} prop={nv.property} key={nv.property_key} label={label}"
             )
         except Exception:
             pass
@@ -263,6 +276,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     addr.update({'cc': alt.command_class, 'endpoint': alt.endpoint or 0, 'property': alt.property, 'property_key': alt.property_key})
             try:
                 self.logger.info(f"Addr node={addr['node_id']} cc={addr['cc']} ep={addr['endpoint']} prop={addr['property']} key={addr['property_key']}")
+                if not addr['cc'] or not addr['property']:
+                    self.logger.info(f"Addr incomplete for nv={node_val.pk}; will resolve before send")
             except Exception:
                 pass
             self._async_call(self._set_value(addr, value))
@@ -376,6 +391,12 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         """
         try:
             resp = await self._client.async_send_command({'command': 'node.get_defined_value_ids', 'nodeId': node_id})
+            try:
+                cnt = (resp.get('valueIds') if isinstance(resp, dict) else [])
+                cnt = len(cnt) if isinstance(cnt, list) else 0
+                self.logger.info(f"Resolver: server returned {cnt} valueIds for node {node_id}")
+            except Exception:
+                pass
         except Exception:
             resp = None
 
@@ -454,6 +475,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         }
                     except Exception:
                         continue
+                try:
+                    self.logger.info(f"Resolver: driver fallback yielded {len(items)} valueIds for node {node_id}")
+                except Exception:
+                    pass
 
         # Preload metadata for candidates with matching CC/endpoint only (limit scope)
         filtered = [i for i in items if getf(i, 'commandClass') == cc and (getf(i, 'endpoint') or 0) == (endpoint or 0)]
@@ -500,6 +525,12 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             return None
         candidates.sort(key=score, reverse=True)
         best = candidates[0]
+        try:
+            self.logger.info(
+                f"Resolver: best match node={node_id} CC={getf(best,'commandClass')} ep={getf(best,'endpoint') or 0} prop={getf(best,'property')} pname={getf(best,'propertyName')}"
+            )
+        except Exception:
+            pass
         vid = {
             'commandClass': getf(best, 'commandClass'),
             'endpoint': getf(best, 'endpoint') or 0,
