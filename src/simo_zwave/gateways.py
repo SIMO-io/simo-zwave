@@ -28,7 +28,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
     periodic_tasks = (
         ('maintain', 10),
         ('ufw_expiry_check', 60),
-        ('sync_values', 10),
+        # Slow periodic sync to reduce load/logs; events still keep driver in sync
+        ('sync_values', 30),
         ('migrate_legacy', 60),
     )
 
@@ -41,6 +42,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         self._connected = False
         self._last_state: Dict[str, Any] = {}
         self._last_node_refresh: Dict[int, float] = {}
+        self._last_sync_log: float = 0.0
 
     # --------------- Lifecycle ---------------
     def run(self, exit):
@@ -138,7 +140,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         try:
             if self._client and self._client.connected:
                 try:
-                    self.logger.info("Sync tick: importing state")
+                    now = time.time()
+                    if now - self._last_sync_log > 120:
+                        self._last_sync_log = now
+                        self.logger.info("Sync tick: importing state")
                 except Exception:
                     pass
                 self._async_call(self._import_driver_state())
@@ -619,8 +624,9 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         class _NV: pass
         nv_like = _NV(); nv_like.command_class=cc; nv_like.endpoint=endpoint; nv_like.property=prop; nv_like.property_key=prop_key
         value_id = self._build_value_id(nv_like)
+        log_prop = value_id.get('property') if isinstance(value_id, dict) else prop
         try:
-            self.logger.info(f"Set start node={node_id} cc={cc} ep={endpoint} prop={prop} key={prop_key} value={value}")
+            self.logger.info(f"Set start node={node_id} cc={cc} ep={endpoint} prop={log_prop} key={prop_key} value={value}")
             res = await self._client.async_send_command({
                 'command': 'node.set_value',
                 'nodeId': node_id,
@@ -738,8 +744,13 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             zn.name = name
         zn.alive = True
         zn.save()
+        # Log node import summary only when value count changes
         try:
-            self.logger.info(f"Import node {node_id}: values={len(node_state.get('values') or [])}")
+            vcount = len(node_state.get('values') or [])
+            key = f"node:{node_id}:vcount"
+            if self._last_state.get(key) != vcount:
+                self._last_state[key] = vcount
+                self.logger.info(f"Import node {node_id}: values={vcount}")
         except Exception:
             pass
         values = node_state.get('values', {})
@@ -816,11 +827,40 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     defaults=data,
                 )
         else:
-            for k, v in data.items():
-                setattr(nv, k, v)
-        nv.save()
+            # Update only changed fields; avoid flipping addressing for CC 37/38 when a component is linked
+            changed_fields = []
+            # addressing fields guarded
+            allow_addr_change = not nv.component or nv.command_class not in (37, 38)
+            if nv.command_class != data['command_class'] and allow_addr_change:
+                nv.command_class = data['command_class']; changed_fields.append('command_class')
+            if (nv.endpoint or 0) != (data['endpoint'] or 0) and allow_addr_change:
+                nv.endpoint = data['endpoint']; changed_fields.append('endpoint')
+            incoming_prop = data['property']
+            if nv.property != incoming_prop and allow_addr_change:
+                # For switches/dimmers keep bound NV on targetValue; don't flip to currentValue
+                if not (nv.component and nv.command_class in (37, 38) and str(incoming_prop) == 'currentValue'):
+                    nv.property = incoming_prop; changed_fields.append('property')
+            incoming_pk = data['property_key']
+            if (nv.property_key or '') != (incoming_pk or '') and allow_addr_change:
+                nv.property_key = incoming_pk; changed_fields.append('property_key')
+            # non-address fields
+            for fld in ('genre', 'type', 'label', 'is_read_only', 'index', 'units', 'value_choices'):
+                val_new = data[fld]
+                if getattr(nv, fld) != val_new:
+                    setattr(nv, fld, val_new)
+                    changed_fields.append(fld)
+            # value change is frequent; update only if changed
+            if nv.value != current:
+                nv.value = current
+                nv.value_new = current
+                changed_fields.extend(['value', 'value_new'])
+            if changed_fields:
+                nv.save(update_fields=list(set(changed_fields)))
+            created = False
+        # Log only on create or address change
         try:
-            self.logger.info(f"Import map node={zn.node_id} '{label}' -> NV pk={nv.pk} cc={cc} ep={endpoint} prop={prop} key={prop_key} created={created}")
+            if created:
+                self.logger.info(f"Import map node={zn.node_id} '{label}' -> NV pk={nv.pk} cc={cc} ep={endpoint} prop={prop} key={prop_key} created=True")
         except Exception:
             pass
         # Battery level shortcut
@@ -830,9 +870,11 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         # Push to component if linked
         if nv.component:
             try:
-                nv.component.controller._receive_from_device(nv.value)
+                if nv.value is not None:
+                    nv.component.controller._receive_from_device(nv.value)
             except Exception:
-                self.logger.error("Failed to set component value", exc_info=True)
+                # Lower verbosity; skip noisy stack traces here
+                self.logger.info("Failed to set component value (ignored)")
 
     # With client.listen(), the library updates the driver model internally.
     # We keep DB in sync via periodic full imports or future event hooks.
