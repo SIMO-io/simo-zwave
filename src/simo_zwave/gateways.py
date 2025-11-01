@@ -24,13 +24,15 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
     name = "Z-Wave JS"
     config_form = ZwaveGatewayForm
     auto_create = True
-    # Slow down legacy migration to reduce log noise
     periodic_tasks = (
         ('maintain', 10),
         ('ufw_expiry_check', 60),
         # Slow periodic sync to reduce load/logs; events still keep driver in sync
         ('sync_values', 30),
-        ('migrate_legacy', 60),
+        # Poll a small set of bound sensor values directly from server for reliability
+        ('sync_bound_values', 20),
+        # Proactively ping dead nodes to bring them back quickly
+        ('ping_dead_nodes', 10),
     )
 
     def __init__(self, *args, **kwargs):
@@ -43,6 +45,47 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         self._last_state: Dict[str, Any] = {}
         self._last_node_refresh: Dict[int, float] = {}
         self._last_sync_log: float = 0.0
+        self._last_dead_ping: Dict[int, float] = {}
+
+    # --------------- Helpers ---------------
+    @staticmethod
+    def _normalize_label(txt: Optional[str]) -> str:
+        """Normalize common sensor labels across OZW and Z-Wave JS.
+
+        This helps us match existing component-bound NodeValues that were
+        created with legacy labels (e.g. "Temperature", "Luminance",
+        "Sensor") to Z-Wave JS value labels (e.g. "Air temperature",
+        "Illuminance", Notification-based motion labels).
+        """
+        if not txt:
+            return ''
+        t = str(txt).strip().lower()
+        # Simple canonicalization
+        repl = {
+            'air temperature': 'temperature',
+            'temperature': 'temperature',
+            'temp': 'temperature',
+            'illuminance': 'luminance',
+            'luminance': 'luminance',
+            'light': 'luminance',
+            'light level': 'luminance',
+            'lux': 'luminance',
+            'relative humidity': 'humidity',
+            'humidity': 'humidity',
+            'home security': 'motion',
+            'motion alarm': 'motion',
+            'motion': 'motion',
+            'sensor': 'motion',
+            'burglar': 'motion',
+            'motion sensor status': 'motion',
+        }
+        # Try exact, else partial contains for common words
+        if t in repl:
+            return repl[t]
+        for key, val in repl.items():
+            if key in t:
+                return val
+        return t
 
     # --------------- Lifecycle ---------------
     def run(self, exit):
@@ -131,82 +174,154 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         controller = self._client.driver.controller
         for node in list(getattr(controller, 'nodes', {}).values()):
             try:
-                node.on('value updated', lambda event, n=node: self._on_value_event(event))
-                node.on('value added', lambda event, n=node: self._on_value_event(event))
-                node.on('value notification', lambda event, n=node: self._on_value_event(event))
-                node.on('notification', lambda event, n=node: self._on_value_event(event))
-                node.on('metadata updated', lambda event, n=node: self._on_value_event(event))
-                node.on('dead', lambda event, n=node: self._on_node_status_event(event))
-                node.on('alive', lambda event, n=node: self._on_node_status_event(event))
-                node.on('sleep', lambda event, n=node: self._on_node_status_event(event))
-                node.on('wake up', lambda event, n=node: self._on_node_status_event(event))
+                node.on('value updated', lambda event, n=node: self._on_value_event(event, n))
+                node.on('value added', lambda event, n=node: self._on_value_event(event, n))
+                node.on('value removed', lambda event, n=node: self._on_value_event(event, n))
+                node.on('value notification', lambda event, n=node: self._on_value_event(event, n))
+                node.on('notification', lambda event, n=node: self._on_value_event(event, n))
+                node.on('metadata updated', lambda event, n=node: self._on_value_event(event, n))
+                node.on('dead', lambda event, n=node: self._on_node_status_event(event, n))
+                node.on('alive', lambda event, n=node: self._on_node_status_event(event, n))
+                node.on('sleep', lambda event, n=node: self._on_node_status_event(event, n))
+                node.on('wake up', lambda event, n=node: self._on_node_status_event(event, n))
             except Exception:
                 self.logger.error(f"Failed to attach listeners for node {getattr(node,'node_id',None)}", exc_info=True)
                 continue
 
-    def _on_value_event(self, event):
+    def _on_value_event(self, event, node=None):
         try:
-            node = event.get('node')
-            if not node:
+            # Normalize event to dict payload
+            data = event
+            if hasattr(event, 'data') and isinstance(event.data, dict):
+                data = event.data
+            if not isinstance(data, dict):
                 return
-            val_obj = event.get('value') or event.get('value_notification')
-            args = event.get('args') or {}
-            # Build a val dict similar to _import_driver_state
-            if val_obj is not None:
-                meta = getattr(val_obj, 'metadata', None)
-                val = {
-                    'commandClass': getattr(val_obj, 'command_class', None),
-                    'endpoint': getattr(val_obj, 'endpoint', 0) or 0,
-                    'property': getattr(val_obj, 'property_', None),
-                    'propertyKey': getattr(val_obj, 'property_key', None),
-                    'propertyName': getattr(val_obj, 'property_name', None),
-                    'value': getattr(val_obj, 'value', None),
-                    'metadata': {
-                        'label': getattr(meta, 'label', None),
-                        'unit': getattr(meta, 'unit', ''),
-                        'writeable': getattr(meta, 'writeable', False),
-                        'type': getattr(meta, 'type', ''),
-                        'states': getattr(meta, 'states', None) or [],
-                    },
-                }
-            else:
-                # Fall back to event args structure
-                val = {
-                    'commandClass': args.get('commandClass') or args.get('ccId'),
-                    'endpoint': args.get('endpoint') or 0,
-                    'property': args.get('property'),
-                    'propertyKey': args.get('propertyKey'),
-                    'propertyName': args.get('propertyName'),
-                    'value': args.get('newValue', args.get('value')),
-                    'metadata': args.get('metadata') or {},
-                }
+            event_name = str(data.get('event') or '').lower()
+            args = data.get('args') or {}
+            # Derive node id
+            node_id = getattr(node, 'node_id', None) or data.get('nodeId')
+            if not node_id:
+                return
+            if event_name == 'notification':
+                # Log full notification context for visibility
+                try:
+                    self.logger.warning(f"Notification event node={node_id} data={data}")
+                except Exception:
+                    pass
+                # Proactively poll bound values on this node (e.g. CC48/113 motion)
+                try:
+                    self._poll_node_bound_values(node_id)
+                except Exception:
+                    self.logger.error(f"Notification follow-up poll failed node={node_id}", exc_info=True)
+                return
+            if event_name == 'value removed':
+                # Do not push a None/removed value into components; rely on next update
+                try:
+                    self.logger.info(f"Skip fast-path for value removed node={node_id} args={args}")
+                except Exception:
+                    pass
+                return
+            # Build a val dict similar to _import_driver_state using args
+            val = {
+                'commandClass': args.get('commandClass') or args.get('ccId'),
+                'endpoint': args.get('endpoint') or args.get('endpointIndex') or 0,
+                'property': args.get('property'),
+                'propertyKey': args.get('propertyKey'),
+                'propertyName': args.get('propertyName'),
+                'value': args.get('newValue', args.get('value')),
+                'metadata': args.get('metadata') or {},
+            }
+            if val.get('commandClass') is None or (val.get('property') is None and val.get('propertyName') is None):
+                # Fail loudly for unmapped value events to guide improvements
+                try:
+                    self.logger.error(f"Unmapped value event node={node_id} event={event_name} args={args}")
+                except Exception:
+                    pass
+                # As a fallback, poll this node.
+                try:
+                    self._poll_node_bound_values(node_id)
+                except Exception:
+                    pass
+                return
             try:
                 self.logger.info(
-                    f"Event value node={node.node_id} cc={val.get('commandClass')} ep={val.get('endpoint')} prop={val.get('property')} key={val.get('propertyKey')} val={val.get('value')}"
+                    f"Event value node={node_id} cc={val.get('commandClass')} ep={val.get('endpoint')} prop={val.get('property')} key={val.get('propertyKey')} val={val.get('value')}"
                 )
             except Exception:
                 pass
             state = {
-                'nodeId': node.node_id,
+                'nodeId': node_id,
                 'name': getattr(node, 'name', '') or '',
                 'productLabel': getattr(node, 'product_label', '') or '',
-                'status': getattr(node, 'status', None),
+                'status': getattr(node, 'status', None) if node is not None else None,
                 'values': [val],
                 'partial': True,
             }
+            # Fast-path: immediately push event value to a bound component if we have an exact match
+            try:
+                from .models import ZwaveNode as ZN, NodeValue as NV
+                cc = val.get('commandClass')
+                ep = val.get('endpoint') or 0
+                prop = val.get('property')
+                pkey = val.get('propertyKey')
+                ev_value = val.get('value')
+                if cc is not None and prop is not None:
+                    zn = ZN.objects.filter(gateway=self.gateway_instance, node_id=node_id).first()
+                    if zn:
+                        nv = NV.objects.filter(
+                            node=zn,
+                            command_class=cc,
+                            endpoint=ep,
+                            property=str(prop),
+                            property_key='' if pkey is None else str(pkey),
+                            component__isnull=False,
+                        ).select_related('component').first()
+                        if nv and nv.component:
+                            out_val = ev_value
+                            # Normalize common CC types
+                            if cc == 48 and isinstance(out_val, (int, float)):
+                                out_val = bool(int(out_val))
+                            if cc == 113:
+                                if isinstance(out_val, str):
+                                    out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
+                                elif isinstance(out_val, (int, float)):
+                                    out_val = bool(int(out_val))
+                            try:
+                                nv.component.controller._receive_from_device(out_val, is_alive=True)
+                                # best-effort: persist latest event value in background
+                                def _persist_event_value(pk, val_raw):
+                                    try:
+                                        from .models import NodeValue as _NV
+                                        nv2 = _NV.objects.filter(pk=pk).first()
+                                        if nv2 and nv2.value != val_raw:
+                                            nv2.value = val_raw
+                                            nv2.value_new = val_raw
+                                            nv2.save(update_fields=['value', 'value_new'])
+                                    except Exception:
+                                        pass
+                                asyncio.run_coroutine_threadsafe(asyncio.to_thread(_persist_event_value, nv.pk, ev_value), self._loop)
+                            except Exception:
+                                self.logger.error(
+                                    f"Fast-path event push failed comp={getattr(nv.component,'id',None)} node={node_id} cc={cc} ep={ep} prop={prop}",
+                                    exc_info=True,
+                                )
+            except Exception:
+                # Do not block event processing
+                pass
             import asyncio as _asyncio
             _asyncio.run_coroutine_threadsafe(self._import_node_async(state), self._loop)
         except Exception:
             self.logger.error("Unhandled exception in value event", exc_info=True)
 
-    def _on_node_status_event(self, event):
+    def _on_node_status_event(self, event, node=None):
         try:
-            node = event.get('node')
-            if not node:
-                return
-            etype = str(event.get('type') or '')
+            # Normalize event
+            data = event
+            if hasattr(event, 'data') and isinstance(event.data, dict):
+                data = event.data
+            etype = str((data.get('event') or '')).lower()
             is_alive = etype != 'dead'
-            node_id = getattr(node, 'node_id', None)
+            node_id = getattr(node, 'node_id', None) or data.get('nodeId')
             # Defer all DB work to a thread to avoid async ORM errors
             def _apply_status():
                 from .models import ZwaveNode as ZN, NodeValue as NV
@@ -223,25 +338,26 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         if not comp or comp.id in seen:
                             continue
                         seen.add(comp.id)
-                        try:
-                            comp.controller._receive_from_device(comp.value, is_alive=is_alive)
-                        except Exception:
-                            self.logger.error(
-                                f"Failed to propagate availability to component {getattr(comp,'id',None)} for node {zn.node_id}",
-                                exc_info=True,
-                            )
-                            try:
-                                comp.alive = is_alive
-                                comp.save(update_fields=['alive'])
-                            except Exception:
-                                self.logger.error(
-                                    f"Failed to persist availability directly for component {getattr(comp,'id',None)}",
-                                    exc_info=True,
-                                )
+                    try:
+                        # Only update availability without touching value to avoid re-translating
+                        if comp.alive != is_alive:
+                            comp.alive = is_alive
+                            comp.save(update_fields=['alive'])
+                    except Exception:
+                        self.logger.error(
+                            f"Failed to persist availability directly for component {getattr(comp,'id',None)}",
+                            exc_info=True,
+                        )
                 except Exception:
                     self.logger.error("Failed availability propagation sweep", exc_info=True)
 
             asyncio.run_coroutine_threadsafe(asyncio.to_thread(_apply_status), self._loop)
+            if etype in ('wake up', 'alive') and node_id:
+                # On wake-up, proactively poll bound values for this node
+                try:
+                    self._poll_node_bound_values(node_id)
+                except Exception:
+                    self.logger.error(f"Wake-up follow-up poll failed node={node_id}", exc_info=True)
         except Exception:
             self.logger.error("Unhandled exception in node status event", exc_info=True)
 
@@ -282,123 +398,169 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         except Exception:
             self.logger.error("Periodic sync failed", exc_info=True)
 
-    # --- Legacy bindings migration (one-time) ---
-    _migrating = False
+    def sync_bound_values(self):
+        """Poll current values for bound sensor NodeValues directly from server.
 
-    def migrate_legacy(self):
+        This covers cases where library model events do not propagate or battery
+        devices updated while we were offline. Limited to common sensor CCs.
+        """
         try:
-            if self._migrating:
-                return
-            cfg = self.gateway_instance.config or {}
-            if cfg.get('legacy_migration_done'):
-                return
             if not (self._client and self._client.connected):
                 return
-            self._migrating = True
-            from simo_zwave.models import NodeValue
-            # Only migrate rows bound to components and without addressing
-            pending = list(NodeValue.objects.filter(
+            from django.db.models import Q
+            from .models import NodeValue as NV, ZwaveNode as ZN
+            # Only poll a subset: measurement + binary sensor-like
+            qs = NV.objects.filter(
                 node__gateway=self.gateway_instance,
                 component__isnull=False,
-                command_class__isnull=True
-            )[:25])
-            if not pending:
-                cfg['legacy_migration_done'] = True
-                self.gateway_instance.config = cfg
-                self.gateway_instance.save(update_fields=['config'])
-                return
-            for nv in pending:
+                command_class__in=[49, 48, 113],
+            ).select_related('node', 'component')[:64]
+            for nv in qs:
                 try:
+                    vid = self._build_value_id(nv)
+                    if not vid.get('commandClass') or vid.get('property') is None:
+                        continue
+                    resp = self._async_call(self._client.async_send_command({
+                        'command': 'node.get_value',
+                        'nodeId': nv.node_id,
+                        'valueId': vid,
+                    }), timeout=10)
+                    cur = None
+                    if isinstance(resp, dict):
+                        cur = resp.get('value', resp.get('result'))
+                    else:
+                        cur = resp
+                    # Normalize CC48/113 to boolean for binary sensor comps
+                    out_val = cur
+                    if nv.command_class == 48 and isinstance(out_val, (int, float)):
+                        out_val = bool(int(out_val))
+                    if nv.command_class == 113:
+                        if isinstance(out_val, str):
+                            out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
+                        elif isinstance(out_val, (int, float)):
+                            out_val = bool(int(out_val))
+                    if nv.value != cur:
+                        nv.value = cur
+                        nv.value_new = cur
+                        nv.save(update_fields=['value', 'value_new'])
+                        try:
+                            self.logger.info(f"Polled update node={nv.node_id} cc={nv.command_class} prop={nv.property} -> {cur}")
+                        except Exception:
+                            pass
+                    # Push to component (always propagate alive state)
                     try:
-                        self.logger.info(f"Migrating NV pk={nv.pk} comp={nv.component_id} base_type={nv.component.base_type}")
+                        alive = True if nv.node and nv.node.alive else True
+                        nv.component.controller._receive_from_device(out_val, is_alive=alive)
                     except Exception:
-                        self.logger.error("Failed to log migration start", exc_info=True)
-                    self._migrate_one_legacy(nv)
+                        self.logger.error(
+                            f"Failed to propagate polled value comp={getattr(nv.component,'id',None)} node={nv.node_id} cc={nv.command_class}",
+                            exc_info=True,
+                        )
                 except Exception:
-                    self.logger.error(f"Legacy migration failed for NV pk={nv.pk}", exc_info=True)
+                    # One failure should not abort the whole poll cycle
                     continue
-        finally:
-            self._migrating = False
-
-    def _migrate_one_legacy(self, nv: 'NodeValue'):
-        comp = nv.component
-        if not comp:
-            return
-        # Map base_type to CC target and expected write pattern
-        base_type = (comp.base_type or '').lower()
-        if base_type in ('switch', 'lock', 'blinds', 'gate'):
-            cc = 37  # Binary Switch as default for switch-like
-        elif base_type in ('dimmer', 'rgbw-light'):
-            cc = 38  # Multilevel Switch
-        elif base_type in ('binary-sensor',):
-            # Resolve any boolean value matching this node/label
-            cc = None
-        elif base_type in ('numeric-sensor',):
-            # Resolve any numeric value matching this node/label
-            cc = None
-        else:
-            try:
-                self.logger.info(f"Skip migration for NV pk={nv.pk} base_type={base_type}")
-            except Exception:
-                pass
-            return
-        # Resolve a writable ValueID using resolver (falls back to driver model)
-        try:
-            label = nv.label or (comp.name if comp else None)
-            resolved = self._async_call(self._resolve_value_id_async(
-                nv.node.node_id, cc, None, None, None, label, desired_value=nv.value
-            ))
         except Exception:
-            resolved = None
-        if not resolved:
-            try:
-                dbg = {}
+            self.logger.error("Bound values poll failed", exc_info=True)
+
+    def _poll_node_bound_values(self, node_id: int):
+        """Poll all bound values for a specific node immediately."""
+        from .models import NodeValue as NV
+        try:
+            q = NV.objects.filter(
+                node__gateway=self.gateway_instance,
+                node_id=node_id,
+                component__isnull=False,
+                command_class__in=[49, 48, 113],
+            ).select_related('component', 'node')
+            for nv in q:
                 try:
-                    if self._client and self._client.driver:
-                        node = self._client.driver.controller.nodes.get(nv.node.node_id)
-                        if node and getattr(node, 'values', None):
-                            vals = list(node.values.values())
-                            dbg['total_values'] = len(vals)
-                            dbg['endpoints'] = sorted({getattr(v, 'endpoint', 0) or 0 for v in vals})
-                            dbg['ccs'] = sorted({getattr(v, 'command_class', None) for v in vals})
-                            desired_cc = 37 if base_type in ('switch','lock','blinds','gate','rgbw-light') else 38 if base_type == 'dimmer' else None
-                            if desired_cc is not None:
-                                props = [str(getattr(v, 'property_', None)) for v in vals if getattr(v, 'command_class', None) == desired_cc]
-                                eps = sorted({getattr(v, 'endpoint', 0) or 0 for v in vals if getattr(v, 'command_class', None) == desired_cc})
-                                dbg['desired_cc'] = desired_cc
-                                dbg['desired_cc_endpoints'] = eps
-                                dbg['desired_cc_props_sample'] = props[:8]
-                except Exception:
-                    self.logger.error("Failed building migration debug info", exc_info=True)
-                self.logger.info(
-                    f"NV pk={nv.pk} no suitable target found; skipping (base_type={base_type}) node={nv.node.node_id} comp={nv.component_id} dbg={dbg}"
-                )
-            except Exception:
-                self.logger.error("Failed to log migration debug info", exc_info=True)
-            # For switches/dimmers where we failed to resolve, ask node to refresh its values (throttled)
-            if cc in (37, 38):
-                now = time.time()
-                last = self._last_node_refresh.get(nv.node.node_id, 0)
-                if now - last > 300:
+                    vid = self._build_value_id(nv)
+                    if not vid.get('commandClass') or vid.get('property') is None:
+                        continue
+                    resp = self._async_call(self._client.async_send_command({
+                        'command': 'node.get_value',
+                        'nodeId': node_id,
+                        'valueId': vid,
+                    }), timeout=10)
+                    cur = resp.get('value', resp.get('result')) if isinstance(resp, dict) else resp
+                    out_val = cur
+                    if nv.command_class == 48 and isinstance(out_val, (int, float)):
+                        out_val = bool(int(out_val))
+                    if nv.command_class == 113:
+                        if isinstance(out_val, str):
+                            out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
+                        elif isinstance(out_val, (int, float)):
+                            out_val = bool(int(out_val))
+                    if nv.value != cur:
+                        nv.value = cur
+                        nv.value_new = cur
+                        nv.save(update_fields=['value', 'value_new'])
                     try:
-                        self._async_call(self._client.async_send_command({'command': 'node.refresh_values', 'nodeId': nv.node.node_id}))
-                        self._last_node_refresh[nv.node.node_id] = now
-                        self.logger.info(f"Requested node {nv.node.node_id} values refresh for migration")
+                        alive = True if nv.node and nv.node.alive else True
+                        nv.component.controller._receive_from_device(out_val, is_alive=alive)
+                    except Exception:
+                        self.logger.error(
+                            f"Failed to propagate polled node value comp={getattr(nv.component,'id',None)} node={node_id} cc={nv.command_class}",
+                            exc_info=True,
+                        )
+                except Exception:
+                    continue
+        except Exception:
+            self.logger.error(f"_poll_node_bound_values failed node={node_id}", exc_info=True)
+
+    def ping_dead_nodes(self):
+        """Periodically ping nodes marked as dead to nudge them back alive."""
+        try:
+            if not (self._client and self._client.connected):
+                return
+            from .models import ZwaveNode as ZN, NodeValue as NV
+            dead_nodes = list(ZN.objects.filter(gateway=self.gateway_instance, alive=False)[:12])
+            now = time.time()
+            for zn in dead_nodes:
+                try:
+                    last = self._last_dead_ping.get(zn.node_id, 0)
+                    if now - last < 9:
+                        continue
+                    self._last_dead_ping[zn.node_id] = now
+                    try:
+                        self.logger.info(f"Pinging dead node {zn.node_id}")
                     except Exception:
                         pass
-            return
-        # Persist mapping
-        nv.command_class = resolved.get('commandClass')
-        nv.endpoint = resolved.get('endpoint') or 0
-        nv.property = resolved.get('property')
-        nv.property_key = resolved.get('propertyKey')
-        nv.save(update_fields=['command_class', 'endpoint', 'property', 'property_key'])
-        try:
-            self.logger.info(
-                f"Migrated NV pk={nv.pk} to CC={nv.command_class} ep={nv.endpoint} prop={nv.property} key={nv.property_key} label={label}"
-            )
+                    resp = self._async_call(self._client.async_send_command({
+                        'command': 'node.ping',
+                        'nodeId': zn.node_id,
+                    }), timeout=10)
+                    responded = None
+                    if isinstance(resp, dict):
+                        # Some servers return {'responded': bool} or {'result': bool}
+                        responded = resp.get('responded')
+                        if responded is None:
+                            responded = resp.get('result')
+                    elif isinstance(resp, bool):
+                        responded = resp
+                    if responded:
+                        # Optimistically mark alive and propagate while we await events
+                        if not zn.alive:
+                            zn.alive = True
+                            zn.save(update_fields=['alive'])
+                            try:
+                                comps = [nv.component for nv in NV.objects.filter(node=zn, component__isnull=False).select_related('component')]
+                                seen = set()
+                                for comp in comps:
+                                    if not comp or comp.id in seen:
+                                        continue
+                                    seen.add(comp.id)
+                                    try:
+                                        comp.controller._receive_from_device(comp.value, is_alive=True)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                except Exception:
+                    self.logger.error(f"Dead node ping failed node={getattr(zn,'node_id',None)}", exc_info=True)
         except Exception:
-            pass
+            self.logger.error("ping_dead_nodes sweep failed", exc_info=True)
+
 
     # --------------- MQTT commands ---------------
     def perform_value_send(self, component, value):
@@ -732,6 +894,23 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 s += 1
             if pname and label and str(pname).lower() == str(label).lower():
                 s += 1
+            # Normalized label matching boosts (helps migrating legacy Basic -> real CC values)
+            try:
+                norm_label = self._normalize_label(label)
+                norm_pname = self._normalize_label(pname)
+                if norm_label and norm_pname and norm_label == norm_pname:
+                    s += 3
+                # For sensor synonyms with different property names (Air temperature, Illuminance)
+                if norm_label == 'temperature' and self._normalize_label(prop_i) in ('temperature', 'air temperature'):
+                    s += 2
+                if norm_label == 'luminance' and self._normalize_label(prop_i) in ('luminance', 'illuminance', 'lux'):
+                    s += 2
+                if norm_label == 'humidity' and self._normalize_label(prop_i) in ('humidity', 'relative humidity'):
+                    s += 2
+                if norm_label == 'motion' and getf(item, 'commandClass') in (48, 113):
+                    s += 2
+            except Exception:
+                pass
             # writable/read-only preference: prefer writeable only for switches/dimmers
             meta = meta_cache.get(id(item), {})
             is_writeable = isinstance(meta, dict) and meta.get('writeable')
@@ -971,7 +1150,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             prev_alive = self._last_state.get(key_alive)
             if prev_alive is None or bool(prev_alive) != bool(zn.alive):
                 self._last_state[key_alive] = bool(zn.alive)
-                # Propagate availability to components bound to this node
+                # Update availability only; avoid sending values again to prevent double translation
                 from .models import NodeValue as NV
                 comps = [nv2.component for nv2 in NV.objects.filter(node=zn, component__isnull=False).select_related('component')]
                 seen = set()
@@ -980,21 +1159,14 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         continue
                     seen.add(comp.id)
                     try:
-                        comp.controller._receive_from_device(comp.value, is_alive=zn.alive)
-                    except Exception:
-                        self.logger.error(
-                            f"Failed to propagate availability (import) to component {getattr(comp,'id',None)} for node {zn.node_id}",
-                            exc_info=True,
-                        )
-                        try:
-                            # Hard-set alive as last resort
+                        if comp.alive != zn.alive:
                             comp.alive = zn.alive
                             comp.save(update_fields=['alive'])
-                        except Exception:
-                            self.logger.error(
-                                f"Failed to persist availability directly for component {getattr(comp,'id',None)}",
-                                exc_info=True,
-                            )
+                    except Exception:
+                        self.logger.error(
+                            f"Failed to persist availability directly for component {getattr(comp,'id',None)}",
+                            exc_info=True,
+                        )
         except Exception:
             pass
         # Log node import summary only when value count changes, and only on full imports
@@ -1026,6 +1198,22 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         read_only = not (val.get('metadata') or {}).get('writeable', False)
         vtype = (val.get('metadata') or {}).get('type') or ''
         current = val.get('value')
+
+        # Avoid importing misleading Basic CC placeholders for sensor values
+        # Some Fibaro sensors expose Basic CC (32) entries like targetValue or
+        # restorePrevious that are not the real sensor measurements/events.
+        # These incorrectly stole bindings during migration.
+        if cc == 32 and str(prop) in ('targetValue', 'restorePrevious'):
+            norm = self._normalize_label(label)
+            if norm in ('temperature', 'luminance', 'humidity', 'motion'):
+                try:
+                    self.logger.info(
+                        f"Skip Basic placeholder for sensor label='{label}' node={zn.node_id} ep={endpoint} prop={prop}"
+                    )
+                except Exception:
+                    pass
+                return
+
         data = {
             'genre': None,
             'type': str(vtype),
@@ -1111,13 +1299,32 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             except Exception:
                 nv = None
         # Fallback to label/name matching
-        base_qs = NodeValue.objects.filter(node=zn).filter(Q(name__iexact=label) | Q(label__iexact=label))
+        # Try exact label/name match first
+        base_qs = NodeValue.objects.filter(node=zn)
         try:
-            nv = nv or base_qs.filter(component__isnull=False).first()
+            nv = nv or base_qs.filter(Q(name__iexact=label) | Q(label__iexact=label), component__isnull=False).first()
         except Exception:
             nv = None
         if not nv:
-            nv = base_qs.first()
+            nv = base_qs.filter(Q(name__iexact=label) | Q(label__iexact=label)).first()
+        # If not found, try normalized/synonym matching for legacy labels
+        if not nv:
+            norm = self._normalize_label(label)
+            if norm:
+                try:
+                    candidates = list(base_qs.filter(component__isnull=False))
+                except Exception:
+                    candidates = []
+                chosen = None
+                for cand in candidates:
+                    if self._normalize_label(getattr(cand, 'label', '') or '') == norm:
+                        chosen = cand
+                        break
+                    if self._normalize_label(getattr(cand, 'name', '') or '') == norm:
+                        chosen = cand
+                        break
+                if chosen:
+                    nv = chosen
         created = False
         if not nv:
             # Try to reuse a single existing assigned value with matching type/units (best-effort)
@@ -1138,6 +1345,9 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             changed_fields = []
             # addressing fields guarded
             allow_addr_change = not nv.component or nv.command_class not in (37, 38)
+            # Additional guard: do not overwrite component-bound sensor addressing with Basic CC placeholders
+            if nv.component and cc == 32 and str(prop) in ('targetValue', 'restorePrevious'):
+                allow_addr_change = False
             if nv.command_class != data['command_class'] and allow_addr_change:
                 nv.command_class = data['command_class']; changed_fields.append('command_class')
             if (nv.endpoint or 0) != (data['endpoint'] or 0) and allow_addr_change:
@@ -1170,12 +1380,18 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 self.logger.info(f"Import map node={zn.node_id} '{label}' -> NV pk={nv.pk} cc={cc} ep={endpoint} prop={prop} key={prop_key} created=True")
         except Exception:
             pass
-        # Push to component if linked (normalize binary values for CC48/Basic mapping)
+        # Push to component if linked (normalize binary values for CC48/CC113/Basic mapping)
         if nv.component:
             try:
                 out_val = nv.value
                 if cc in (48,) and isinstance(out_val, (int, float)):
                     out_val = bool(int(out_val))
+                elif cc == 113:
+                    # Notification CC: map to boolean-ish for motion-like events
+                    if isinstance(out_val, str):
+                        out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
+                    elif isinstance(out_val, (int, float)):
+                        out_val = bool(int(out_val))
                 nv.component.controller._receive_from_device(out_val, is_alive=zn.alive)
             except Exception:
                 self.logger.error(
@@ -1189,7 +1405,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 zn.save(update_fields=['battery_level'])
             except Exception:
                 pass
-            # Update battery level across all components bound to this node without changing their values
+            # Update battery level on components only; do not send their values again
             try:
                 from .models import NodeValue as NV
                 comps = [nv2.component for nv2 in NV.objects.filter(node=zn, component__isnull=False).select_related('component')]
@@ -1199,10 +1415,11 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         continue
                     seen.add(comp.id)
                     try:
-                        comp.controller._receive_from_device(comp.value, is_alive=zn.alive, battery_level=current)
+                        comp.battery_level = current
+                        comp.save(update_fields=['battery_level'])
                     except Exception:
                         self.logger.error(
-                            f"Failed to propagate battery to component {getattr(comp,'id',None)} for node {zn.node_id} level={current}",
+                            f"Failed to persist battery to component {getattr(comp,'id',None)} for node {zn.node_id} level={current}",
                             exc_info=True,
                         )
             except Exception:
@@ -1219,11 +1436,6 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     target_nv = NodeValue.objects.filter(
                         node=zn, command_class=cc, endpoint=0, property='targetValue', component__isnull=False
                     ).first()
-                # Fallback: any endpoint with a bound targetValue for this CC
-                if not target_nv:
-                    target_nv = NodeValue.objects.filter(
-                        node=zn, command_class=cc, property='targetValue', component__isnull=False
-                    ).order_by('endpoint').first()
             except Exception:
                 target_nv = None
             if target_nv and target_nv.component:
@@ -1242,7 +1454,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 return
         if cc in (37, 38) and str(prop) == 'targetValue':
             try:
-                # Symmetric: update a bound currentValue if present
+                # Symmetric: update a bound currentValue if present (same endpoint or root)
                 curr_nv = NodeValue.objects.filter(
                     node=zn, command_class=cc, endpoint=endpoint, property='currentValue', component__isnull=False
                 ).first()
