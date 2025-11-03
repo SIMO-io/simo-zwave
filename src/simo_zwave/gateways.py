@@ -339,13 +339,11 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                             continue
                         seen.add(comp.id)
                     try:
-                        # Only update availability without touching value to avoid re-translating
-                        if comp.alive != is_alive:
-                            comp.alive = is_alive
-                            comp.save(update_fields=['alive'])
+                        # Always propagate availability through controller to keep a single path
+                        comp.controller._receive_from_device(comp.value, is_alive=is_alive)
                     except Exception:
                         self.logger.error(
-                            f"Failed to persist availability directly for component {getattr(comp,'id',None)}",
+                            f"Failed to propagate availability to component {getattr(comp,'id',None)} for node {zn.node_id}",
                             exc_info=True,
                         )
                 except Exception:
@@ -430,16 +428,16 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         cur = resp.get('value', resp.get('result'))
                     else:
                         cur = resp
-                    # Normalize CC48/113 to boolean for binary sensor comps
-                    out_val = cur
-                    if nv.command_class == 48 and isinstance(out_val, (int, float)):
-                        out_val = bool(int(out_val))
-                    if nv.command_class == 113:
-                        if isinstance(out_val, str):
-                            out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
-                        elif isinstance(out_val, (int, float)):
-                            out_val = bool(int(out_val))
                     if nv.value != cur:
+                        # Normalize CC48/113 to boolean for binary sensor comps
+                        out_val = cur
+                        if nv.command_class == 48 and isinstance(out_val, (int, float)):
+                            out_val = bool(int(out_val))
+                        if nv.command_class == 113:
+                            if isinstance(out_val, str):
+                                out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
+                            elif isinstance(out_val, (int, float)):
+                                out_val = bool(int(out_val))
                         nv.value = cur
                         nv.value_new = cur
                         nv.save(update_fields=['value', 'value_new'])
@@ -447,15 +445,15 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                             self.logger.info(f"Polled update node={nv.node_id} cc={nv.command_class} prop={nv.property} -> {cur}")
                         except Exception:
                             pass
-                    # Push to component (always propagate alive state)
-                    try:
-                        alive = True if nv.node and nv.node.alive else True
-                        nv.component.controller._receive_from_device(out_val, is_alive=alive)
-                    except Exception:
-                        self.logger.error(
-                            f"Failed to propagate polled value comp={getattr(nv.component,'id',None)} node={nv.node_id} cc={nv.command_class}",
-                            exc_info=True,
-                        )
+                        # Push to component on change
+                        try:
+                            alive = True if nv.node and nv.node.alive else True
+                            nv.component.controller._receive_from_device(out_val, is_alive=alive)
+                        except Exception:
+                            self.logger.error(
+                                f"Failed to propagate polled value comp={getattr(nv.component,'id',None)} node={nv.node_id} cc={nv.command_class}",
+                                exc_info=True,
+                            )
                 except Exception:
                     # One failure should not abort the whole poll cycle
                     continue
@@ -483,26 +481,26 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         'valueId': vid,
                     }), timeout=10)
                     cur = resp.get('value', resp.get('result')) if isinstance(resp, dict) else resp
-                    out_val = cur
-                    if nv.command_class == 48 and isinstance(out_val, (int, float)):
-                        out_val = bool(int(out_val))
-                    if nv.command_class == 113:
-                        if isinstance(out_val, str):
-                            out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
-                        elif isinstance(out_val, (int, float)):
-                            out_val = bool(int(out_val))
                     if nv.value != cur:
+                        out_val = cur
+                        if nv.command_class == 48 and isinstance(out_val, (int, float)):
+                            out_val = bool(int(out_val))
+                        if nv.command_class == 113:
+                            if isinstance(out_val, str):
+                                out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
+                            elif isinstance(out_val, (int, float)):
+                                out_val = bool(int(out_val))
                         nv.value = cur
                         nv.value_new = cur
                         nv.save(update_fields=['value', 'value_new'])
-                    try:
-                        alive = True if nv.node and nv.node.alive else True
-                        nv.component.controller._receive_from_device(out_val, is_alive=alive)
-                    except Exception:
-                        self.logger.error(
-                            f"Failed to propagate polled node value comp={getattr(nv.component,'id',None)} node={node_id} cc={nv.command_class}",
-                            exc_info=True,
-                        )
+                        try:
+                            alive = True if nv.node and nv.node.alive else True
+                            nv.component.controller._receive_from_device(out_val, is_alive=alive)
+                        except Exception:
+                            self.logger.error(
+                                f"Failed to propagate polled node value comp={getattr(nv.component,'id',None)} node={node_id} cc={nv.command_class}",
+                                exc_info=True,
+                            )
                 except Exception:
                     continue
         except Exception:
@@ -1150,7 +1148,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             prev_alive = self._last_state.get(key_alive)
             if prev_alive is None or bool(prev_alive) != bool(zn.alive):
                 self._last_state[key_alive] = bool(zn.alive)
-                # Update availability only; avoid sending values again to prevent double translation
+                # Propagate availability via controller; value unchanged so no extra history entries
                 from .models import NodeValue as NV
                 comps = [nv2.component for nv2 in NV.objects.filter(node=zn, component__isnull=False).select_related('component')]
                 seen = set()
@@ -1159,12 +1157,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         continue
                     seen.add(comp.id)
                     try:
-                        if comp.alive != zn.alive:
-                            comp.alive = zn.alive
-                            comp.save(update_fields=['alive'])
+                        comp.controller._receive_from_device(comp.value, is_alive=zn.alive)
                     except Exception:
                         self.logger.error(
-                            f"Failed to persist availability directly for component {getattr(comp,'id',None)}",
+                            f"Failed to propagate availability (import) to component {getattr(comp,'id',None)} for node {zn.node_id}",
                             exc_info=True,
                         )
         except Exception:
@@ -1184,10 +1180,13 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             vals_iter = values.values()
         else:
             vals_iter = values
+        # For partial imports (event-driven), we've already fast-pushed the value
+        # to components. To avoid duplicate history, update DB only without pushing.
+        push = not bool(node_state.get('partial'))
         for v in vals_iter:
-            self._import_value(zn, v)
+            self._import_value(zn, v, push=push)
 
-    def _import_value(self, zn: ZwaveNode, val: Dict[str, Any]):
+    def _import_value(self, zn: ZwaveNode, val: Dict[str, Any], push: bool = True):
         from django.db.models import Q
         cc = val.get('commandClass')
         endpoint = val.get('endpoint') or 0
@@ -1381,7 +1380,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         except Exception:
             pass
         # Push to component if linked (normalize binary values for CC48/CC113/Basic mapping)
-        if nv.component:
+        if push and nv.component:
             try:
                 out_val = nv.value
                 if cc in (48,) and isinstance(out_val, (int, float)):
@@ -1425,7 +1424,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             except Exception:
                 self.logger.error("Battery propagation sweep failed", exc_info=True)
         # Push to component if linked. For switches/dimmers, prefer targetValue/currentValue-bound NV
-        if cc in (37, 38) and str(prop) == 'currentValue':
+        if push and cc in (37, 38) and str(prop) == 'currentValue':
             try:
                 # First try exact endpoint
                 target_nv = NodeValue.objects.filter(
@@ -1452,7 +1451,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         exc_info=True,
                     )
                 return
-        if cc in (37, 38) and str(prop) == 'targetValue':
+        if push and cc in (37, 38) and str(prop) == 'targetValue':
             try:
                 # Symmetric: update a bound currentValue if present (same endpoint or root)
                 curr_nv = NodeValue.objects.filter(
@@ -1477,7 +1476,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         exc_info=True,
                     )
                 return
-        if nv.component:
+        if push and nv.component:
             try:
                 if nv.value is not None:
                     nv.component.controller._receive_from_device(nv.value, is_alive=zn.alive)
