@@ -31,6 +31,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         ('sync_bound_values', 20),
         # Proactively ping dead nodes to bring them back quickly
         ('ping_dead_nodes', 10),
+        # Sync node name/location from bound SIMO components
+        ('sync_node_labels', 60),
     )
 
     def __init__(self, *args, **kwargs):
@@ -45,6 +47,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         self._last_sync_log: float = 0.0
         self._last_dead_ping: Dict[int, float] = {}
         self._last_push: Dict[int, Any] = {}
+        self._last_node_labels: Dict[int, tuple] = {}
         # Config-driven routing caches for Component.config-based mapping
         self._value_map: Dict[tuple, list] = {}
         self._node_to_components: Dict[int, list] = {}
@@ -548,6 +551,82 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     self.logger.error(f"Dead node ping failed node={nid}", exc_info=True)
         except Exception:
             self.logger.error("ping_dead_nodes sweep failed", exc_info=True)
+
+
+    def sync_node_labels(self):
+        """Synchronize Z-Wave node name/location from bound SIMO components."""
+        try:
+            if not (self._client and self._client.connected):
+                return
+            # Ensure routing map is up to date
+            try:
+                self._rebuild_config_map()
+            except Exception:
+                pass
+            # Access driver nodes if available for current labels
+            try:
+                nodes_map = getattr(self._client.driver.controller, 'nodes', {}) or {}
+            except Exception:
+                nodes_map = {}
+            from simo.core.models import Component as _C
+            for nid, comp_ids in list((self._node_to_components or {}).items()):
+                try:
+                    comps = list(_C.objects.filter(id__in=comp_ids).select_related('zone').only('id', 'name', 'zone'))
+                    # Build unique, ordered name and location lists
+                    def _uniq(seq):
+                        seen = set(); out = []
+                        for s in seq:
+                            if not s:
+                                continue
+                            if s not in seen:
+                                seen.add(s); out.append(s)
+                        return out
+                    names = _uniq([str(getattr(c, 'name', '')).strip() for c in comps])
+                    zones = _uniq([str(getattr(getattr(c, 'zone', None), 'name', '')).strip() for c in comps])
+                    desired_name = ', '.join(names) if names else ''
+                    desired_loc = ', '.join(zones) if zones else ''
+                    last = self._last_node_labels.get(nid)
+                    # Compare with driver model if available
+                    try:
+                        node = nodes_map.get(nid)
+                        current_name = (getattr(node, 'name', None) or '').strip()
+                        current_loc = (getattr(node, 'location', None) or '').strip()
+                    except Exception:
+                        current_name = ''
+                        current_loc = ''
+                    # Only send when changed compared to both cache and driver
+                    want_set_name = bool(desired_name) and desired_name != current_name
+                    want_set_loc = bool(desired_loc) and desired_loc != current_loc
+                    if last and not want_set_name and not want_set_loc:
+                        continue
+                    # Send updates
+                    if want_set_name:
+                        try:
+                            self._async_call(self._client.async_send_command({
+                                'command': 'node.set_name',
+                                'nodeId': nid,
+                                'name': desired_name,
+                                'updateCC': True,
+                            }), timeout=10)
+                        except Exception:
+                            self.logger.error(f"Failed to set node name nid={nid}", exc_info=True)
+                    if want_set_loc:
+                        try:
+                            self._async_call(self._client.async_send_command({
+                                'command': 'node.set_location',
+                                'nodeId': nid,
+                                'location': desired_loc,
+                                'updateCC': True,
+                            }), timeout=10)
+                        except Exception:
+                            self.logger.error(f"Failed to set node location nid={nid}", exc_info=True)
+                    # Update cache if we attempted any change
+                    if want_set_name or want_set_loc:
+                        self._last_node_labels[nid] = (desired_name, desired_loc)
+                except Exception:
+                    self.logger.error(f"sync_node_labels failed nid={nid}", exc_info=True)
+        except Exception:
+            self.logger.error("sync_node_labels sweep failed", exc_info=True)
 
 
     # --------------- MQTT commands ---------------
