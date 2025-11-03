@@ -13,8 +13,6 @@ from simo.core.form_fields import (
     Select2ModelChoiceField, Select2ListChoiceField,
     Select2ModelMultipleChoiceField
 )
-from .models import ZwaveNode, NodeValue
-from .widgets import AdminNodeValueValueWidget, AdminNodeValueSelectWidget
 
 
 class _ClickableUrlWidget(forms.Widget):
@@ -113,102 +111,6 @@ class ZwaveGatewayForm(BaseGatewayForm):
             pass
 
 
-class AdminNodeValueInlineForm(forms.ModelForm):
-    value = forms.CharField(required=False)
-
-    class Meta:
-        model = NodeValue
-        fields = 'label', 'value', 'units', 'genre',
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.org_val = self.instance.value
-        if self.instance.is_read_only:
-            self.fields['value'].widget = AdminReadonlyFieldWidget()
-        else:
-            if self.instance.type in ('Button', 'Bool'):
-                self.fields['value'].widget = AdminNodeValueSelectWidget(
-                    self.instance.value_new,
-                    choices=[('True', 'True'), ('False', 'False')]
-                )
-            elif self.instance.type == 'List' and self.instance.value_choices:
-                self.fields['value'].widget = AdminNodeValueSelectWidget(
-                    self.instance.value_new,
-                    choices=[('%s' % c, c) for c in self.instance.value_choices],
-                    attrs={'style': 'width:200px'}
-                )
-            else:
-                self.fields['value'].widget = AdminNodeValueValueWidget(
-                    self.instance.value_new
-                )
-
-
-        if self.instance.genre != 'User':
-            self.fields['name'].widget = EmptyFieldWidget()
-
-
-    def clean_value(self):
-
-        val = self.cleaned_data['value']
-
-        if self.instance.type in ('Button', 'Bool'):
-            if val == 'True':
-                val = True
-            elif val == 'False':
-                val = False
-            else:
-                raise forms.ValidationError("Must be True or False")
-
-
-        elif self.instance.type in ('Byte', 'Int', 'Short'):
-            try:
-                val = int(val)
-            except:
-                raise forms.ValidationError("Must be a number")
-
-            if self.instance.type == 'Byte':
-                if val < 0 or val > 255:
-                    raise forms.ValidationError(
-                        "Must be a number between 0 and 255"
-                    )
-
-            if self.instance.type == 'Short':
-                try:
-                    val = int(val)
-                except:
-                    raise forms.ValidationError(
-                        "Must be an integer between -32768 and 32768"
-                    )
-                else:
-                    if int(val) > 32768 or int(val) < -32768:
-                        raise forms.ValidationError(
-                            "Must be an integer between -32768 and 32768"
-                        )
-
-        elif self.instance.type == 'Decimal':
-            try:
-                val = float(val)
-            except:
-                raise forms.ValidationError("Must be a decimal number")
-
-        return val
-
-    def save(self, commit=True):
-        self.instance.value = self.org_val
-        set_val = False
-        if not self.instance.is_read_only \
-        and self.cleaned_data['value'] != self.org_val:
-            self.instance.value_new = self.cleaned_data['value']
-            set_val = True
-        obj = super().save(commit=commit)
-        if set_val:
-            for gateway in Gateway.objects.filter(type__startswith='simo_zwave'):
-                GatewayObjectCommand(
-                    gateway, self.instance,
-                    set_val=self.cleaned_data['value']
-                ).publish()
-        return obj
-
 
 class ZwaveGatewaySelectForm(forms.Form):
     gateway = forms.ModelChoiceField(
@@ -217,55 +119,11 @@ class ZwaveGatewaySelectForm(forms.Form):
 
 
 
-class BasicZwaveComponentConfigForm(BaseComponentForm):
-    zwave_item = forms.ModelChoiceField(queryset=NodeValue.objects.all())
-
-    node_value = None
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        qs = NodeValue.objects.filter(
-            node__gateway=self.gateway, name__isnull=False,
-        ).filter(
-            Q(component=None) | Q(component=self.instance)
-        ).order_by('node_id', 'id')
-        self.fields['zwave_item'].queryset = qs
-
-
-    def clean_zwave_val(self):
-        if self.cleaned_data['zwave_item'].component in (
-            None, self.instance
-        ):
-            return self.cleaned_data['zwave_item']
-
-        raise forms.ValidationError(
-            'Zwave val already has other component assigned to it'
-        )
-
-    def save(self, commit=True):
-        self.instance.value = self.cleaned_data['zwave_item'].value
-        org_zwave_item = None
-        if not self.instance.pk:
-            self.instance.value_units = self.cleaned_data['zwave_item'].units
-        else:
-            org_zwave_item = NodeValue.objects.get(
-                pk=self.instance.config.get('zwave_item')
-            )
-        obj = super().save(commit=commit)
-        self.cleaned_data['zwave_item'].component = obj
-        self.cleaned_data['zwave_item'].save()
-        if org_zwave_item \
-        and org_zwave_item.pk != self.cleaned_data['zwave_item'].pk:
-            org_zwave_item.component = None
-            org_zwave_item.save()
-        return obj
-
-
-class ZwaveNumericSensorConfigForm(BasicZwaveComponentConfigForm, NumericSensorForm):
+class ZwaveNumericSensorConfigForm(BaseComponentForm, NumericSensorForm):
     pass
 
 
-class ZwaveSwitchConfigForm(BasicZwaveComponentConfigForm):
+class ZwaveSwitchConfigForm(BaseComponentForm):
     slaves = Select2ModelMultipleChoiceField(
         queryset=Component.objects.filter(
             base_type__in=(
@@ -297,7 +155,7 @@ class ZwaveSwitchConfigForm(BasicZwaveComponentConfigForm):
         return obj
 
 
-class ZwaveKnobComponentConfigForm(BasicZwaveComponentConfigForm):
+class ZwaveKnobComponentConfigForm(BaseComponentForm):
     min = forms.FloatField(
         initial=0, help_text="Minimum component value."
     )
@@ -335,7 +193,7 @@ class ZwaveKnobComponentConfigForm(BasicZwaveComponentConfigForm):
             obj.slaves.set(self.cleaned_data['slaves'])
         return obj
 
-class RGBLightComponentConfigForm(BasicZwaveComponentConfigForm):
+class RGBLightComponentConfigForm(BaseComponentForm):
     has_white = forms.BooleanField(
         label=_("Has WHITE color channel"), required=False,
     )
