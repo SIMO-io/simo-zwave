@@ -2,16 +2,17 @@ from simo.core.controllers import (
     BinarySensor, NumericSensor,
     Switch, Dimmer, RGBWLight, Button
 )
+from simo.core.forms import BaseComponentForm
 from .gateways import ZwaveGatewayHandler
 from .forms import (
-    BasicZwaveComponentConfigForm, ZwaveKnobComponentConfigForm,
+    ZwaveKnobComponentConfigForm,
     RGBLightComponentConfigForm, ZwaveNumericSensorConfigForm,
     ZwaveSwitchConfigForm
 )
 
 class ZwaveBinarySensor(BinarySensor):
     gateway_class = ZwaveGatewayHandler
-    config_form = BasicZwaveComponentConfigForm
+    config_form = BaseComponentForm
 
     def _receive_from_device(self, val, **kwargs):
         # Ensure boolean mapping, propagate is_alive/battery_level if provided
@@ -71,7 +72,7 @@ class ZwaveRGBWLight(RGBWLight):
 
 class ZwaveButton(Button):
     gateway_class = ZwaveGatewayHandler
-    config_form = BasicZwaveComponentConfigForm
+    config_form = BaseComponentForm
 
     def _receive_from_device(self, val, **kwargs):
         # Map Z-Wave JS Central Scene event values to Button states.
