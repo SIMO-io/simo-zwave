@@ -1,5 +1,4 @@
 from django import forms
-from django.db.models import Q
 from dal import forward
 from django.utils.translation import gettext_lazy as _
 from simo.core.utils.validators import validate_slaves
@@ -7,7 +6,6 @@ from simo.core.utils.form_widgets import AdminReadonlyFieldWidget, EmptyFieldWid
 from django.utils.safestring import mark_safe
 from simo.core.forms import BaseGatewayForm, BaseComponentForm, NumericSensorForm
 from simo.core.models import Gateway
-from simo.core.events import GatewayObjectCommand
 from simo.core.models import Component
 from simo.core.form_fields import (
     Select2ModelChoiceField, Select2ListChoiceField,
@@ -119,7 +117,7 @@ class ZwaveGatewaySelectForm(forms.Form):
 
 
 
-class ZwaveNumericSensorConfigForm(BaseComponentForm, NumericSensorForm):
+class ZwaveNumericSensorConfigForm(NumericSensorForm):
     pass
 
 
