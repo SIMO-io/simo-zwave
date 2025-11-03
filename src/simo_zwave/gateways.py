@@ -3,7 +3,7 @@ import json
 import logging
 import threading
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 
 import paho.mqtt.client as mqtt
 from django.conf import settings
@@ -167,6 +167,60 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         # Refresh WS URL from config in case it changed
         self._ws_url = self._build_ws_url()
         self._start_ws_thread()
+        # Start/stop inclusion based on discovery state for ZwaveDevice pairing
+        try:
+            disc = (self.gateway_instance.discovery or {})
+            uid = str(disc.get('controller_uid') or '')
+            # Defer import to avoid module import cycles
+            from simo_zwave.controllers import ZwaveDevice  # type: ignore
+            zw_uid = ZwaveDevice.uid
+        except Exception:
+            disc = {}
+            zw_uid = None
+        try:
+            if zw_uid and uid == zw_uid and not disc.get('finished') and self._client and self._client.connected:
+                # Begin inclusion once per discovery session
+                if not disc.get('inclusion_started'):
+                    try:
+                        self.logger.info("Starting Z-Wave inclusion (pairing mode)")
+                    except Exception:
+                        pass
+                    try:
+                        self._async_call(self._controller_command('add_node', None), timeout=10)
+                    except Exception:
+                        try:
+                            self.logger.error("Failed to start inclusion", exc_info=True)
+                        except Exception:
+                            pass
+                    else:
+                        disc['inclusion_started'] = time.time()
+                        self.gateway_instance.discovery = disc
+                        try:
+                            self.gateway_instance.save(update_fields=['discovery'])
+                        except Exception:
+                            pass
+            # If discovery finished, make sure inclusion is stopped
+            if zw_uid and uid == zw_uid and disc.get('finished') and self._client and self._client.connected:
+                if disc.get('inclusion_started') and not disc.get('inclusion_stopped'):
+                    try:
+                        self.logger.info("Stopping Z-Wave inclusion (finish discovery)")
+                    except Exception:
+                        pass
+                    try:
+                        self._async_call(self._controller_command('stop_inclusion', None), timeout=10)
+                    except Exception:
+                        pass
+                    disc['inclusion_stopped'] = time.time()
+                    self.gateway_instance.discovery = disc
+                    try:
+                        self.gateway_instance.save(update_fields=['discovery'])
+                    except Exception:
+                        pass
+        except Exception:
+            try:
+                self.logger.error("Inclusion maintenance error", exc_info=True)
+            except Exception:
+                pass
         # Rebuild config routing map
         try:
             self._rebuild_config_map()
@@ -195,6 +249,43 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             except Exception:
                 self.logger.error(f"Failed to attach listeners for node {getattr(node,'node_id',None)}", exc_info=True)
                 continue
+
+    def _on_mqtt_message(self, client, userdata, msg):
+        # Extend base handling with a lightweight 'discover' trigger for inclusion
+        super()._on_mqtt_message(client, userdata, msg)
+        try:
+            payload = json.loads(msg.payload)
+        except Exception:
+            return
+        cmd = payload.get('command')
+        if cmd != 'discover':
+            return
+        # Start inclusion only when asked to discover ZwaveDevice
+        typ = payload.get('type')
+        try:
+            from simo_zwave.controllers import ZwaveDevice  # type: ignore
+            zw_uid = ZwaveDevice.uid
+        except Exception:
+            zw_uid = None
+        if not zw_uid or typ != zw_uid:
+            return
+        try:
+            if not (self._client and self._client.connected):
+                return
+            self.logger.info("MQTT: begin Z-Wave inclusion")
+            self._async_call(self._controller_command('add_node', None), timeout=10)
+            disc = self.gateway_instance.discovery or {}
+            disc['inclusion_started'] = time.time()
+            self.gateway_instance.discovery = disc
+            try:
+                self.gateway_instance.save(update_fields=['discovery'])
+            except Exception:
+                pass
+        except Exception:
+            try:
+                self.logger.error("Failed to begin inclusion from MQTT discover", exc_info=True)
+            except Exception:
+                pass
 
     def _on_value_event(self, event, node=None):
         try:
@@ -274,6 +365,30 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 'values': [val],
                 'partial': True,
             }
+            # Discovery: if ZwaveDevice pairing is active, lock onto first useful node and adopt
+            try:
+                disc = self.gateway_instance.discovery or {}
+                if disc and not disc.get('finished'):
+                    from simo_zwave.controllers import ZwaveDevice  # type: ignore
+                    if disc.get('controller_uid') == ZwaveDevice.uid:
+                        if val.get('commandClass') is not None and (val.get('property') is not None or val.get('propertyName') is not None):
+                            if disc.get('locked_node') is None:
+                                disc['locked_node'] = int(node_id)
+                                self.gateway_instance.discovery = disc
+                                try:
+                                    self.gateway_instance.save(update_fields=['discovery'])
+                                except Exception:
+                                    pass
+                            if int(disc.get('locked_node') or -1) == int(node_id):
+                                hint = {
+                                    'cc': val.get('commandClass'),
+                                    'endpoint': val.get('endpoint') or 0,
+                                    'property': val.get('property'),
+                                    'propertyKey': val.get('propertyKey'),
+                                }
+                                asyncio.run_coroutine_threadsafe(asyncio.to_thread(self._adopt_from_node, int(node_id), hint), self._loop)
+            except Exception:
+                pass
             # Fast-path: push via config routing (fetch Components in a thread)
             try:
                 cc = val.get('commandClass')
@@ -348,6 +463,23 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     asyncio.run_coroutine_threadsafe(asyncio.to_thread(self._poll_node_bound_values, node_id), self._loop)
                 except Exception:
                     self.logger.error(f"Wake-up follow-up poll failed node={node_id}", exc_info=True)
+                # Discovery: adopt sleepy devices on wake-up if pairing is active
+                try:
+                    disc = self.gateway_instance.discovery or {}
+                    if disc and not disc.get('finished'):
+                        from simo_zwave.controllers import ZwaveDevice  # type: ignore
+                        if disc.get('controller_uid') == ZwaveDevice.uid:
+                            if disc.get('locked_node') is None:
+                                disc['locked_node'] = int(node_id)
+                                self.gateway_instance.discovery = disc
+                                try:
+                                    self.gateway_instance.save(update_fields=['discovery'])
+                                except Exception:
+                                    pass
+                            if int(disc.get('locked_node') or -1) == int(node_id):
+                                asyncio.run_coroutine_threadsafe(asyncio.to_thread(self._adopt_from_node, int(node_id), {}), self._loop)
+                except Exception:
+                    pass
         except Exception:
             self.logger.error("Unhandled exception in node status event", exc_info=True)
 
@@ -1187,6 +1319,217 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     continue
         except Exception:
             self.logger.error("All-bound poll failed", exc_info=True)
+
+    # --------------- Adopt/Discovery helpers ---------------
+    def _adopt_from_node(self, node_id: int, hint: Dict[str, Any]):
+        """Create missing SIMO components for a node during discovery.
+
+        - Creates missing Switch/Dimmer/RGBW components for actuator endpoints.
+        - If no actuators are created, uses the event hint to create one sensor/button.
+        - Appends created component ids to discovery results and finishes discovery.
+        """
+        try:
+            disc = self.gateway_instance.discovery or {}
+            if not disc or disc.get('finished'):
+                return
+            if disc.get('locked_node') is not None and int(disc['locked_node']) != int(node_id):
+                return
+            if not (self._client and self._client.connected):
+                return
+
+            # Fetch defined value IDs
+            try:
+                resp = self._async_call(self._client.async_send_command({
+                    'command': 'node.get_defined_value_ids',
+                    'nodeId': int(node_id),
+                }), timeout=10)
+                items = resp.get('valueIds') if isinstance(resp, dict) else resp
+                if not isinstance(items, list):
+                    items = []
+            except Exception:
+                items = []
+
+            def gi(it, key, default=None):
+                if isinstance(it, dict):
+                    return it.get(key, default)
+                return getattr(it, key, default)
+
+            # Group by endpoint
+            eps: Dict[int, list] = {}
+            for it in items:
+                ep = gi(it, 'endpoint') or 0
+                eps.setdefault(int(ep), []).append(it)
+
+            # Determine actuator endpoints 51 > 38 > 37
+            actuator_eps: List[Tuple[int, int, Any, Any]] = []  # (ep, cc, property, pkey)
+            for ep, elist in eps.items():
+                for cc in (51, 38, 37):
+                    cand = None
+                    for it in elist:
+                        if int(gi(it, 'commandClass') or 0) != cc:
+                            continue
+                        prop = gi(it, 'property')
+                        pkey = gi(it, 'propertyKey')
+                        if str(prop) == 'targetValue':
+                            cand = (ep, cc, prop, pkey)
+                            break
+                        if not cand and str(prop) == 'currentValue':
+                            cand = (ep, cc, prop, pkey)
+                    if cand:
+                        actuator_eps.append(cand)
+                        break
+
+            created_ids: List[int] = []
+
+            # Initial form data (zone/category/name)
+            from simo.core.utils.serialization import deserialize_form_data
+            try:
+                started_with = deserialize_form_data(disc.get('init_data') or {})
+            except Exception:
+                started_with = {}
+            zone = started_with.get('zone')
+            category = started_with.get('category')
+            base_name = (started_with.get('name') or '').strip()
+
+            from simo_zwave.controllers import (
+                ZwaveSwitch, ZwaveDimmer, ZwaveRGBWLight,
+                ZwaveBinarySensor, ZwaveNumericSensor, ZwaveButton,
+            )
+
+            def ctrl_for_cc(cc: int):
+                if cc == 37:
+                    return ZwaveSwitch
+                if cc == 38:
+                    return ZwaveDimmer
+                if cc == 51:
+                    return ZwaveRGBWLight
+                return None
+
+            # Create missing actuator components
+            for ep, cc, prop, pkey in actuator_eps:
+                try:
+                    exists = Component.objects.filter(
+                        gateway=self.gateway_instance,
+                        config__zwave__nodeId=int(node_id),
+                        config__zwave__endpoint=int(ep),
+                        config__zwave__cc=int(cc),
+                        config__zwave__property='targetValue' if str(prop) == 'currentValue' else str(prop),
+                    ).exists()
+                    if exists:
+                        continue
+                    ctrl_cls = ctrl_for_cc(int(cc))
+                    if not ctrl_cls:
+                        continue
+                    ctrl_uid = ctrl_cls.uid
+                    bt = getattr(ctrl_cls, 'base_type', None)
+                    bt_slug = bt if isinstance(bt, str) else getattr(bt, 'slug', None)
+                    store_prop = 'targetValue' if str(prop) == 'currentValue' else str(prop)
+                    cfg = {
+                        'zwave': {
+                            'nodeId': int(node_id),
+                            'cc': int(cc),
+                            'endpoint': int(ep),
+                            'property': store_prop,
+                        }
+                    }
+                    if pkey not in (None, ''):
+                        cfg['zwave']['propertyKey'] = pkey
+                    name = base_name or f"Z-Wave {int(node_id)}"
+                    if len(eps) > 1:
+                        name = f"{name} EP{int(ep)}"
+                    comp = Component(
+                        name=name,
+                        zone=zone or None,
+                        category=category or None,
+                        gateway=self.gateway_instance,
+                        controller_uid=ctrl_uid,
+                        base_type=bt_slug or '',
+                        config=cfg,
+                    )
+                    comp.save()
+                    try:
+                        comp.value = comp.controller.default_value
+                        comp.save(update_fields=['value'])
+                    except Exception:
+                        pass
+                    created_ids.append(comp.id)
+                except Exception:
+                    self.logger.error("Failed to create actuator component", exc_info=True)
+
+            # If none created, try one sensor/button based on hint
+            if not created_ids and hint and isinstance(hint, dict):
+                try:
+                    cc = int(hint.get('cc')) if hint.get('cc') is not None else None
+                except Exception:
+                    cc = None
+                ep = int(hint.get('endpoint') or 0)
+                prop = hint.get('property')
+                pkey = hint.get('propertyKey')
+                ctrl_cls = None
+                if cc in (48, 113):
+                    ctrl_cls = ZwaveBinarySensor
+                elif cc == 49:
+                    ctrl_cls = ZwaveNumericSensor
+                elif cc == 91:
+                    ctrl_cls = ZwaveButton
+                if ctrl_cls:
+                    try:
+                        ctrl_uid = ctrl_cls.uid
+                        bt = getattr(ctrl_cls, 'base_type', None)
+                        bt_slug = bt if isinstance(bt, str) else getattr(bt, 'slug', None)
+                        cfg = {
+                            'zwave': {
+                                'nodeId': int(node_id),
+                                'cc': int(cc) if cc is not None else None,
+                                'endpoint': int(ep),
+                                'property': str(prop) if prop is not None else 'currentValue',
+                            }
+                        }
+                        if pkey not in (None, ''):
+                            cfg['zwave']['propertyKey'] = pkey
+                        name = base_name or f"Z-Wave {int(node_id)}"
+                        if len(eps) > 1:
+                            name = f"{name} EP{int(ep)}"
+                        comp = Component(
+                            name=name,
+                            zone=zone or None,
+                            category=category or None,
+                            gateway=self.gateway_instance,
+                            controller_uid=ctrl_uid,
+                            base_type=bt_slug or '',
+                            config=cfg,
+                        )
+                        comp.save()
+                        try:
+                            comp.value = comp.controller.default_value
+                            comp.save(update_fields=['value'])
+                        except Exception:
+                            pass
+                        created_ids.append(comp.id)
+                    except Exception:
+                        self.logger.error("Failed to create sensor/button component", exc_info=True)
+
+            if not created_ids:
+                return
+            # Append to discovery and finish
+            try:
+                for cid in created_ids:
+                    self.gateway_instance.append_discovery_result(cid)
+                self.gateway_instance.save(update_fields=['discovery'])
+            except Exception:
+                pass
+            try:
+                self.gateway_instance.finish_discovery()
+            except Exception:
+                pass
+            # Stop inclusion if active
+            try:
+                if self._client and self._client.connected:
+                    self._async_call(self._controller_command('stop_inclusion', None), timeout=10)
+            except Exception:
+                pass
+        except Exception:
+            self.logger.error("_adopt_from_node failed", exc_info=True)
 
     # ---------- Dedup helpers ----------
     def _should_push(self, comp_id: int, value: Any) -> bool:

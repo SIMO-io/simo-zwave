@@ -5,10 +5,11 @@ from typing import Any, Dict
 
 from simo.core.controllers import (
     BinarySensor, NumericSensor,
-    Switch, Dimmer, RGBWLight, Button
+    Switch, Dimmer, RGBWLight, Button, ControllerBase
 )
 from simo.core.forms import BaseComponentForm
 from .gateways import ZwaveGatewayHandler
+from .base_types import ZwaveDeviceType
 from .forms import (
     ZwaveKnobComponentConfigForm,
     RGBLightComponentConfigForm, ZwaveNumericSensorConfigForm,
@@ -249,6 +250,7 @@ class ZwaveDynamicConfigMixin:
 class ZwaveBinarySensor(ZwaveDynamicConfigMixin, BinarySensor):
     gateway_class = ZwaveGatewayHandler
     config_form = BaseComponentForm
+    manual_add = False
 
     def _receive_from_device(self, val, **kwargs):
         # Ensure boolean mapping, propagate is_alive/battery_level if provided
@@ -257,11 +259,13 @@ class ZwaveBinarySensor(ZwaveDynamicConfigMixin, BinarySensor):
 class ZwaveNumericSensor(ZwaveDynamicConfigMixin, NumericSensor):
     gateway_class = ZwaveGatewayHandler
     config_form = ZwaveNumericSensorConfigForm
+    manual_add = False
 
 
 class ZwaveSwitch(ZwaveDynamicConfigMixin, Switch):
     gateway_class = ZwaveGatewayHandler
     config_form = ZwaveSwitchConfigForm
+    manual_add = False
 
     def _receive_from_device(self, val, **kwargs):
         return super()._receive_from_device(bool(val), **kwargs)
@@ -270,6 +274,7 @@ class ZwaveSwitch(ZwaveDynamicConfigMixin, Switch):
 class ZwaveDimmer(ZwaveDynamicConfigMixin, Dimmer):
     gateway_class = ZwaveGatewayHandler
     config_form = ZwaveKnobComponentConfigForm
+    manual_add = False
 
     def _send_to_device(self, value):
         conf = self.component.config
@@ -300,6 +305,7 @@ class ZwaveDimmer(ZwaveDynamicConfigMixin, Dimmer):
 class ZwaveRGBWLight(ZwaveDynamicConfigMixin, RGBWLight):
     gateway_class = ZwaveGatewayHandler
     config_form = RGBLightComponentConfigForm
+    manual_add = False
 
     def _receive_from_device(self, val, **kwargs):
         # TODO: need to addapt to map type RGBWLight value.
@@ -309,6 +315,7 @@ class ZwaveRGBWLight(ZwaveDynamicConfigMixin, RGBWLight):
 class ZwaveButton(ZwaveDynamicConfigMixin, Button):
     gateway_class = ZwaveGatewayHandler
     config_form = BaseComponentForm
+    manual_add = False
 
     def _receive_from_device(self, val, **kwargs):
         # Map Z-Wave JS Central Scene event values to Button states.
@@ -344,3 +351,54 @@ class ZwaveButton(ZwaveDynamicConfigMixin, Button):
             pass
         # Fallback: ignore unknowns
         return
+
+
+class ZwaveDevice(ControllerBase):
+    """Z-Wave pairing placeholder used to start inclusion/adoption.
+
+    Users select this single type when adding a new Z-Wave component. The
+    controller starts Z-Wave inclusion and listens for node activity; actual
+    device-specific components (e.g., Switch/Dimmer/Sensor) are created by
+    discovery handlers based on what the node reports.
+    """
+
+    gateway_class = ZwaveGatewayHandler
+    config_form = BaseComponentForm
+    name = "Z-Wave Device"
+    base_type = ZwaveDeviceType
+    default_value = False
+    manual_add = True
+    accepts_value = False
+    discovery_msg = (
+        "Press include on the device or operate it; we will create the matching components."
+    )
+
+    def _validate_val(self, value, occasion=None):
+        return value
+
+    @classmethod
+    def _init_discovery(cls, form_cleaned_data):
+        """Begin Z-Wave inclusion and mark discovery active.
+
+        Stores the initial form data so the gateway/UI can finalize when the
+        first useful node activity is observed.
+        """
+        from simo.core.models import Gateway
+        from simo.core.utils.serialization import serialize_form_data
+        gw = Gateway.objects.filter(type=cls.gateway_class.uid).first()
+        if not gw:
+            return {'error': 'Z-Wave gateway is not configured.'}
+        gw.start_discovery(cls.uid, serialize_form_data(form_cleaned_data), timeout=120)
+        # Nudge the gateway to start controller inclusion over WS
+        from simo.core.events import GatewayObjectCommand
+        GatewayObjectCommand(gw, gw, command='discover', type=cls.uid).publish()
+
+    @classmethod
+    def _process_discovery(cls, started_with, data):
+        """Handled by the gateway upon actual node activity.
+
+        This controller does not create a component for itself; instead the
+        gateway will create device-specific components and append results to
+        the discovery record. Nothing to do here.
+        """
+        return None
