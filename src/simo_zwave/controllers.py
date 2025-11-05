@@ -15,6 +15,7 @@ from .forms import (
     RGBLightComponentConfigForm, ZwaveNumericSensorConfigForm,
     ZwaveSwitchConfigForm
 )
+from simo.core.app_widgets import NumericSensorWidget
 
 try:
     from zwave_js_server.client import Client as ZJSClient
@@ -368,6 +369,7 @@ class ZwaveDevice(ControllerBase):
     base_type = ZwaveDeviceType
     default_value = False
     manual_add = True
+    app_widget = NumericSensorWidget
     accepts_value = False
     discovery_msg = (
         "Press include on the device or operate it; we will create the matching components."
