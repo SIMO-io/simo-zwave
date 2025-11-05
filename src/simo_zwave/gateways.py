@@ -850,20 +850,59 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
 
     # Extend parent MQTT handler to support controller commands
     def _on_mqtt_message(self, client, userdata, msg):
+        """Handle MQTT commands for this gateway.
+
+        Supports:
+          - zwave_command: controller-level commands (add/remove/cancel/etc.)
+          - command=discover with type=ZwaveDevice.uid: begin inclusion
+        Falls back to core handler for set_val / bulk_send.
+        """
+        # First, allow core handler (set_val/bulk_send) to process
+        super()._on_mqtt_message(client, userdata, msg)
         try:
             payload = json.loads(msg.payload)
         except Exception:
-            return super()._on_mqtt_message(client, userdata, msg)
+            return
+        # Controller-scoped command passthrough
         if 'zwave_command' in payload:
             cmd = payload.get('zwave_command')
             node_id = payload.get('node_id')
             try:
+                self.logger.info(f"MQTT zwave_command '{cmd}' node_id={node_id}")
+            except Exception:
+                pass
+            try:
                 self._async_call(self._controller_command(cmd, node_id))
-            except Exception as e:
-                self.logger.error(f"Controller command error: {e}")
+            except Exception:
+                self.logger.error("Controller command error", exc_info=True)
             return
-        # fallback to default handler (set_val, bulk_send)
-        return super()._on_mqtt_message(client, userdata, msg)
+        # Discovery trigger
+        if payload.get('command') == 'discover':
+            typ = payload.get('type')
+            try:
+                from simo_zwave.controllers import ZwaveDevice  # type: ignore
+                zw_uid = ZwaveDevice.uid
+            except Exception:
+                zw_uid = None
+            if not zw_uid or typ != zw_uid:
+                try:
+                    self.logger.info(f"MQTT discover ignored: type mismatch typ='{typ}' expected='{zw_uid}'")
+                except Exception:
+                    pass
+                return
+            if not (self._client and self._client.connected):
+                self.logger.warning("MQTT discover ignored: driver not connected")
+                return
+            try:
+                self.logger.info("MQTT: begin Z-Wave inclusion")
+                self._async_call(self._controller_command('add_node', None), timeout=10)
+                disc = self.gateway_instance.discovery or {}
+                disc['inclusion_started'] = time.time()
+                self.gateway_instance.discovery = disc
+                self.gateway_instance.save(update_fields=['discovery'])
+            except Exception:
+                self.logger.error("Failed to begin inclusion from MQTT discover", exc_info=True)
+            return
 
     async def _controller_command(self, cmd: str, node_id: Optional[int]):
         if not self._client or not self._client.connected:
