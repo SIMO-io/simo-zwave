@@ -1484,6 +1484,11 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         - Appends created component ids to discovery results and finishes discovery.
         """
         try:
+            # Always operate on the freshest discovery state
+            try:
+                self.gateway_instance.refresh_from_db(fields=['discovery'])
+            except Exception:
+                pass
             disc = self.gateway_instance.discovery or {}
             if not disc or disc.get('finished'):
                 return
