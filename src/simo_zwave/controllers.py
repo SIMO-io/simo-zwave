@@ -390,10 +390,19 @@ class ZwaveDevice(ControllerBase):
         gw = Gateway.objects.filter(type=cls.gateway_class.uid).first()
         if not gw:
             return {'error': 'Z-Wave gateway is not configured.'}
+        try:
+            import logging
+            logging.getLogger(__name__).info("ZwaveDevice: start_discovery requested")
+        except Exception:
+            pass
         gw.start_discovery(cls.uid, serialize_form_data(form_cleaned_data), timeout=120)
         # Nudge the gateway to start controller inclusion over WS
         from simo.core.events import GatewayObjectCommand
-        GatewayObjectCommand(gw, gw, command='discover', type=cls.uid).publish()
+        try:
+            GatewayObjectCommand(gw, gw, command='discover', type=cls.uid).publish()
+        except Exception:
+            import logging
+            logging.getLogger(__name__).error("Failed to publish discover command", exc_info=True)
 
     @classmethod
     def _process_discovery(cls, started_with, data):

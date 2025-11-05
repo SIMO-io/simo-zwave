@@ -178,6 +178,12 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             disc = {}
             zw_uid = None
         try:
+            try:
+                self.logger.info(
+                    f"maintain: ws_connected={bool(self._client and self._client.connected)} uid='{uid}' started={bool(disc.get('inclusion_started'))} finished={bool(disc.get('finished'))}"
+                )
+            except Exception:
+                pass
             if zw_uid and uid == zw_uid and not disc.get('finished') and self._client and self._client.connected:
                 # Begin inclusion once per discovery session
                 if not disc.get('inclusion_started'):
@@ -268,9 +274,14 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         except Exception:
             zw_uid = None
         if not zw_uid or typ != zw_uid:
+            try:
+                self.logger.info(f"MQTT discover ignored: type mismatch typ='{typ}' expected='{zw_uid}'")
+            except Exception:
+                pass
             return
         try:
             if not (self._client and self._client.connected):
+                self.logger.warning("MQTT discover ignored: driver not connected")
                 return
             self.logger.info("MQTT: begin Z-Wave inclusion")
             self._async_call(self._controller_command('add_node', None), timeout=10)
@@ -865,7 +876,15 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             'stop_exclusion': {'command': 'controller.stop_exclusion'},
         }
         if cmd in mapping:
-            await self._client.async_send_command(mapping[cmd])
+            try:
+                self.logger.info(f"Controller cmd '{cmd}' -> {mapping[cmd]}")
+            except Exception:
+                pass
+            resp = await self._client.async_send_command(mapping[cmd])
+            try:
+                self.logger.info(f"Controller cmd '{cmd}' result: {resp}")
+            except Exception:
+                pass
             return
         if cmd == 'cancel_command':
             # Try to stop both inclusion and exclusion
