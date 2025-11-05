@@ -6,6 +6,7 @@ import time
 from typing import Dict, Any, Optional, List, Tuple
 
 import paho.mqtt.client as mqtt
+from django.db import models
 from django.conf import settings
 
 from simo.core.models import Component
@@ -555,7 +556,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 for comp in comps:
                     try:
                         zw = (comp.config or {}).get('zwave') or {}
-                        vid = self._build_value_id_from_config(zw)
+                        vid = self._build_value_id_for_read(zw)
                         if not vid.get('commandClass') or vid.get('property') is None:
                             continue
                         resp = self._async_call(self._client.async_send_command({
@@ -622,7 +623,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 for comp in comps:
                     try:
                         zw = (comp.config or {}).get('zwave') or {}
-                        vid = self._build_value_id_from_config(zw)
+                        vid = self._build_value_id_for_read(zw)
                         if not vid.get('commandClass') or not vid.get('property'):
                             continue
                         resp = self._async_call(self._client.async_send_command({
@@ -1066,6 +1067,21 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             vid['propertyKey'] = _coerce(pk)
         return vid
 
+    def _build_value_id_for_read(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a ValueID for reads. For switches/dimmers (cc 37/38),
+        always read 'currentValue' regardless of stored config property.
+        """
+        vid = self._build_value_id_from_config(cfg)
+        try:
+            cc = cfg.get('cc')
+            if cc in (37, 38):
+                vid['property'] = 'currentValue'
+                # propertyKey is not used for currentValue on 37/38
+                vid.pop('propertyKey', None)
+        except Exception:
+            pass
+        return vid
+
     async def _resolve_value_id_async(self, node_id: int, cc: Optional[int], endpoint: Optional[int], prop: Optional[Any], prop_key: Optional[Any], label: Optional[str], desired_value: Any = None) -> Optional[Dict[str, Any]]:
         """Ask server for defined value IDs and pick the best writable match.
 
@@ -1447,7 +1463,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             for comp in comps:
                 try:
                     zw = (comp.config or {}).get('zwave') or {}
-                    vid = self._build_value_id_from_config(zw)
+                    vid = self._build_value_id_for_read(zw)
                     if not vid.get('commandClass') or vid.get('property') is None:
                         continue
                     resp = self._async_call(self._client.async_send_command({
@@ -1642,7 +1658,9 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         config__zwave__nodeId=int(node_id),
                         config__zwave__endpoint=int(ep),
                         config__zwave__cc=int(cc),
-                        config__zwave__property='targetValue' if str(prop) == 'currentValue' else str(prop),
+                    ).filter(
+                        # consider either property to avoid duplicates across versions
+                        models.Q(config__zwave__property='currentValue') | models.Q(config__zwave__property='targetValue')
                     ).exists()
                     if exists:
                         continue
@@ -1652,7 +1670,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     ctrl_uid = ctrl_cls.uid
                     bt = getattr(ctrl_cls, 'base_type', None)
                     bt_slug = bt if isinstance(bt, str) else getattr(bt, 'slug', None)
-                    store_prop = 'targetValue' if str(prop) == 'currentValue' else str(prop)
+                    # Store 'currentValue' for actuators so reads use the true state.
+                    store_prop = 'currentValue'
                     cfg = {
                         'zwave': {
                             'nodeId': int(node_id),
