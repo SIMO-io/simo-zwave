@@ -703,7 +703,11 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             from simo.core.models import Component as _C
             for nid, comp_ids in list((self._node_to_components or {}).items()):
                 try:
-                    comps = list(_C.objects.filter(id__in=comp_ids).select_related('zone').only('id', 'name', 'zone'))
+                    # Use a clean queryset without default select_related from manager
+                    # to avoid "Field ... cannot be both deferred and traversed" errors
+                    # when combining select_related and only(). We only need zone/name here.
+                    comps_qs = _C.objects.filter(id__in=comp_ids).select_related(None).select_related('zone')
+                    comps = list(comps_qs.only('id', 'name', 'zone'))
                     # Build unique, ordered name and location lists
                     def _uniq(seq):
                         seen = set(); out = []
