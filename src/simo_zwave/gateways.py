@@ -33,6 +33,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         ('ping_dead_nodes', 10),
         # Sync node name/location from bound SIMO components
         ('sync_node_labels', 60),
+        # Auto-finish discovery when UI stops polling
+        ('push_discoveries', 6),
     )
 
     def __init__(self, *args, **kwargs):
@@ -260,6 +262,11 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         # Extend base handling with a lightweight 'discover' trigger for inclusion
         super()._on_mqtt_message(client, userdata, msg)
         try:
+            # Ensure current discovery state reflects latest form init_data
+            try:
+                self.gateway_instance.refresh_from_db(fields=['discovery'])
+            except Exception:
+                pass
             payload = json.loads(msg.payload)
         except Exception:
             return
@@ -285,6 +292,14 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 return
             self.logger.info("MQTT: begin Z-Wave inclusion")
             self._async_call(self._controller_command('add_node', None), timeout=10)
+            try:
+                self.gateway_instance.refresh_from_db(fields=['discovery'])
+            except Exception:
+                pass
+            try:
+                self.gateway_instance.refresh_from_db(fields=['discovery'])
+            except Exception:
+                pass
             disc = self.gateway_instance.discovery or {}
             disc['inclusion_started'] = time.time()
             self.gateway_instance.discovery = disc
@@ -300,6 +315,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
 
     def _on_value_event(self, event, node=None):
         try:
+            # If discovery has been finished externally, ensure inclusion is stopped promptly
+            self._ensure_discovery_stopped()
             # Normalize event to dict payload
             data = event
             if hasattr(event, 'data') and isinstance(event.data, dict):
@@ -378,6 +395,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             }
             # Discovery: if ZwaveDevice pairing is active, lock onto first useful node and adopt
             try:
+                try:
+                    self.gateway_instance.refresh_from_db(fields=['discovery'])
+                except Exception:
+                    pass
                 disc = self.gateway_instance.discovery or {}
                 if disc and not disc.get('finished'):
                     from simo_zwave.controllers import ZwaveDevice  # type: ignore
@@ -442,6 +463,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
 
     def _on_node_status_event(self, event, node=None):
         try:
+            # If discovery has been finished externally, ensure inclusion is stopped promptly
+            self._ensure_discovery_stopped()
             # Normalize event
             data = event
             if hasattr(event, 'data') and isinstance(event.data, dict):
@@ -476,6 +499,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     self.logger.error(f"Wake-up follow-up poll failed node={node_id}", exc_info=True)
                 # Discovery: adopt sleepy devices on wake-up if pairing is active
                 try:
+                    try:
+                        self.gateway_instance.refresh_from_db(fields=['discovery'])
+                    except Exception:
+                        pass
                     disc = self.gateway_instance.discovery or {}
                     if disc and not disc.get('finished'):
                         from simo_zwave.controllers import ZwaveDevice  # type: ignore
@@ -555,6 +582,35 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 self.logger.error("Config-bound poll failed", exc_info=True)
         except Exception:
             self.logger.error("Bound values poll failed", exc_info=True)
+
+    def push_discoveries(self):
+        """Finish discovery when the UI stops polling.
+
+        The admin UI periodically updates discovery['last_check'] via the
+        RunningDiscoveries endpoint. If that heartbeat stops for >10s,
+        automatically finish discovery to clean up pairing state.
+        """
+        try:
+            import time as _time
+            from simo.core.models import Gateway as _Gateway
+            # Consider all gateways of this type
+            for gw in _Gateway.objects.filter(type=self.uid, discovery__has_key='start').exclude(discovery__has_key='finished'):
+                disc = gw.discovery or {}
+                last = disc.get('last_check')
+                try:
+                    stale = (last is None) or ((_time.time() - float(last)) > 10)
+                except Exception:
+                    stale = True
+                if stale:
+                    try:
+                        gw.finish_discovery()
+                    except Exception:
+                        pass
+        except Exception:
+            try:
+                self.logger.error("push_discoveries failed", exc_info=True)
+            except Exception:
+                pass
 
     def _poll_node_bound_values(self, node_id: int):
         """Poll all config-bound values for a specific node immediately."""
@@ -897,6 +953,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 # Do NOT reset discovery/init_data here; it was set by the UI form
                 self.logger.info("MQTT: begin Z-Wave inclusion")
                 self._async_call(self._controller_command('add_node', None), timeout=10)
+                try:
+                    self.gateway_instance.refresh_from_db(fields=['discovery'])
+                except Exception:
+                    pass
                 disc = self.gateway_instance.discovery or {}
                 # Ensure controller is set but preserve init_data
                 if not disc.get('controller_uid'):
@@ -961,6 +1021,32 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         return 'ws://127.0.0.1:3000'
 
     
+    def _ensure_discovery_stopped(self):
+        """If discovery has finished, ensure inclusion is stopped immediately."""
+        try:
+            try:
+                self.gateway_instance.refresh_from_db(fields=['discovery'])
+            except Exception:
+                pass
+            disc = self.gateway_instance.discovery or {}
+            if not disc.get('finished'):
+                return
+            if self._client and self._client.connected and disc.get('inclusion_started') and not disc.get('inclusion_stopped'):
+                try:
+                    self._async_call(self._controller_command('stop_inclusion', None), timeout=10)
+                except Exception:
+                    pass
+                disc['inclusion_stopped'] = time.time()
+                self.gateway_instance.discovery = disc
+                try:
+                    self.gateway_instance.save(update_fields=['discovery'])
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                self.logger.error("_ensure_discovery_stopped failed", exc_info=True)
+            except Exception:
+                pass
 
     def _build_value_id_from_config(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         def _coerce(val: Any) -> Any:
