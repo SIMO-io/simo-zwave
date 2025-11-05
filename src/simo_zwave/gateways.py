@@ -894,17 +894,13 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 self.logger.warning("MQTT discover ignored: driver not connected")
                 return
             try:
-                # Reset discovery state cleanly for this gateway
-                try:
-                    from simo_zwave.controllers import ZwaveDevice  # type: ignore
-                    # Use a small default timeout; wizard controls lifecycle
-                    self.gateway_instance.start_discovery(ZwaveDevice.uid, {}, timeout=120)
-                    self.logger.info("MQTT: discovery state reset for new inclusion")
-                except Exception:
-                    self.logger.error("Failed to reset discovery state", exc_info=True)
+                # Do NOT reset discovery/init_data here; it was set by the UI form
                 self.logger.info("MQTT: begin Z-Wave inclusion")
                 self._async_call(self._controller_command('add_node', None), timeout=10)
                 disc = self.gateway_instance.discovery or {}
+                # Ensure controller is set but preserve init_data
+                if not disc.get('controller_uid'):
+                    disc['controller_uid'] = zw_uid
                 # Clear any stale flags from previous sessions
                 for k in ('finished', 'locked_node', 'inclusion_stopped'):
                     disc.pop(k, None)
@@ -1462,12 +1458,76 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 started_with = {}
             zone = started_with.get('zone')
             category = started_with.get('category')
+            icon = started_with.get('icon')
+            alarm_pref = started_with.get('alarm_category')
             base_name = (started_with.get('name') or '').strip()
 
             from simo_zwave.controllers import (
                 ZwaveSwitch, ZwaveDimmer, ZwaveRGBWLight,
                 ZwaveBinarySensor, ZwaveNumericSensor, ZwaveButton,
             )
+            if not zone:
+                try:
+                    self.logger.error("Discovery adoption aborted: no Zone provided in init data")
+                except Exception:
+                    pass
+                return
+            inst = getattr(zone, 'instance', None)
+
+            # Category helpers based on type if user did not preselect
+            def default_category_for_actuator():
+                try:
+                    from simo.core.models import Category
+                    if inst:
+                        return Category.objects.filter(instance=inst, name__icontains='lights').first()
+                except Exception:
+                    return None
+            def default_category_for_binary_sensor():
+                try:
+                    from simo.core.models import Category
+                    if inst:
+                        return Category.objects.filter(instance=inst, name__icontains='security').first()
+                except Exception:
+                    return None
+            def default_category_for_numeric_sensor():
+                try:
+                    from simo.core.models import Category
+                    if inst:
+                        return Category.objects.filter(instance=inst, name__icontains='climate').first()
+                except Exception:
+                    return None
+            def default_category_for_button():
+                try:
+                    from simo.core.models import Category
+                    if inst:
+                        return Category.objects.filter(instance=inst, name__icontains='other').first()
+                except Exception:
+                    return None
+
+            # Icon helpers
+            def _get_icon(slug: str):
+                try:
+                    from simo.core.models import Icon
+                    return Icon.objects.filter(slug=slug).first()
+                except Exception:
+                    return None
+
+            def default_icon_for_actuator():
+                return _get_icon('lightbulb')
+
+            def default_icon_for_button():
+                return _get_icon('tablet-button')
+
+            def default_icon_for_numeric(prop_any):
+                try:
+                    p = (str(prop_any) if prop_any is not None else '').lower()
+                except Exception:
+                    p = ''
+                if any(k in p for k in ('illumin', 'lumin', 'lux', 'light')):
+                    return _get_icon('brightness')
+                if 'temp' in p:
+                    return _get_icon('temperature-half')
+                return None
 
             def ctrl_for_cc(cc: int):
                 if cc == 37:
@@ -1479,6 +1539,11 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 return None
 
             # Create missing actuator components
+            # If multiple actuators are created, number them 1..N with the given base name
+            numbered_names = {}
+            if base_name and len(actuator_eps) > 1:
+                for i, tpl in enumerate(sorted(actuator_eps, key=lambda t: int(t[0])), start=1):
+                    numbered_names[tpl] = f"{base_name} {i}"
             for ep, cc, prop, pkey in actuator_eps:
                 try:
                     exists = Component.objects.filter(
@@ -1507,13 +1572,15 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     }
                     if pkey not in (None, ''):
                         cfg['zwave']['propertyKey'] = pkey
-                    name = base_name or f"Z-Wave {int(node_id)}"
-                    if len(eps) > 1:
-                        name = f"{name} EP{int(ep)}"
+                    if base_name:
+                        name = numbered_names.get((ep, cc, prop, pkey)) or base_name
+                    else:
+                        name = f"Z-Wave {int(node_id)}"
                     comp = Component(
                         name=name,
-                        zone=zone or None,
-                        category=category or None,
+                        zone=zone,
+                        category=category or default_category_for_actuator() or None,
+                        icon=icon or default_icon_for_actuator() or None,
                         gateway=self.gateway_instance,
                         controller_uid=ctrl_uid,
                         base_type=bt_slug or '',
@@ -1529,48 +1596,113 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 except Exception:
                     self.logger.error("Failed to create actuator component", exc_info=True)
 
-            # If none created, try one sensor/button based on hint
-            if not created_ids and hint and isinstance(hint, dict):
-                try:
-                    cc = int(hint.get('cc')) if hint.get('cc') is not None else None
-                except Exception:
-                    cc = None
-                ep = int(hint.get('endpoint') or 0)
-                prop = hint.get('property')
-                pkey = hint.get('propertyKey')
-                ctrl_cls = None
-                if cc in (48, 113):
-                    ctrl_cls = ZwaveBinarySensor
-                elif cc == 49:
-                    ctrl_cls = ZwaveNumericSensor
-                elif cc == 91:
-                    ctrl_cls = ZwaveButton
-                if ctrl_cls:
+            # If none created, try to create one component per sensor/button type present
+            if not created_ids:
+                # Determine sensor kinds available on this node from defined valueIds
+                def _kind_for_item(it):
+                    p = str(gi(it, 'propertyName') or gi(it, 'property') or '').lower()
+                    c = int(gi(it, 'commandClass') or 0)
+                    if c == 91:
+                        return 'button'
+                    if c in (48, 113):
+                        return 'motion'
+                    if c == 49:
+                        if any(k in p for k in ('illumin', 'lumin', 'lux', 'light')):
+                            return 'brightness'
+                        if 'temp' in p:
+                            return 'temperature'
+                    return None
+
+                sensor_kinds = {}
+                for it in items:
+                    kind = _kind_for_item(it)
+                    if not kind or kind in sensor_kinds:
+                        continue
+                    cc = int(gi(it, 'commandClass') or 0)
+                    ep = int(gi(it, 'endpoint') or 0)
+                    prop = gi(it, 'property')
+                    pkey = gi(it, 'propertyKey')
+                    if prop is None:
+                        continue
+                    sensor_kinds[kind] = (cc, ep, prop, pkey)
+
+                # Also include hint if it adds a new kind
+                if hint and isinstance(hint, dict):
                     try:
+                        h_cc = int(hint.get('cc')) if hint.get('cc') is not None else None
+                    except Exception:
+                        h_cc = None
+                    if h_cc is not None:
+                        dummy = {'commandClass': h_cc, 'endpoint': hint.get('endpoint'), 'property': hint.get('property')}
+                        h_kind = _kind_for_item(dummy)
+                        if h_kind and h_kind not in sensor_kinds:
+                            sensor_kinds[h_kind] = (
+                                int(hint.get('cc')) if hint.get('cc') is not None else 0,
+                                int(hint.get('endpoint') or 0),
+                                hint.get('property'),
+                                hint.get('propertyKey'),
+                            )
+
+                # Create components for kinds in a sensible order
+                for kind in ['temperature', 'brightness', 'motion', 'button']:
+                    if kind not in sensor_kinds:
+                        continue
+                    cc, ep, prop, pkey = sensor_kinds[kind]
+                    try:
+                        exists = Component.objects.filter(
+                            gateway=self.gateway_instance,
+                            config__zwave__nodeId=int(node_id),
+                            config__zwave__endpoint=int(ep),
+                            config__zwave__cc=int(cc),
+                            config__zwave__property=str(prop),
+                        ).exists()
+                        if exists:
+                            continue
+                        # Controller per kind
+                        ctrl_cls = ZwaveNumericSensor if kind in ('temperature', 'brightness') else (
+                            ZwaveBinarySensor if kind == 'motion' else ZwaveButton
+                        )
                         ctrl_uid = ctrl_cls.uid
                         bt = getattr(ctrl_cls, 'base_type', None)
                         bt_slug = bt if isinstance(bt, str) else getattr(bt, 'slug', None)
                         cfg = {
                             'zwave': {
                                 'nodeId': int(node_id),
-                                'cc': int(cc) if cc is not None else None,
+                                'cc': int(cc),
                                 'endpoint': int(ep),
-                                'property': str(prop) if prop is not None else 'currentValue',
+                                'property': str(prop),
                             }
                         }
                         if pkey not in (None, ''):
                             cfg['zwave']['propertyKey'] = pkey
+                        # Name: base_name + kind (when base provided), else generic
                         name = base_name or f"Z-Wave {int(node_id)}"
-                        if len(eps) > 1:
-                            name = f"{name} EP{int(ep)}"
+                        if base_name:
+                            name = f"{base_name} {kind}"
+                        # Defaults
+                        if ctrl_cls is ZwaveBinarySensor:
+                            cat = category or default_category_for_binary_sensor() or None
+                            alarm_cat = alarm_pref or 'security'
+                            icon_obj = icon or None
+                        elif ctrl_cls is ZwaveNumericSensor:
+                            cat = category or default_category_for_numeric_sensor() or None
+                            icon_obj = icon or default_icon_for_numeric(prop) or None
+                            alarm_cat = alarm_pref or None
+                        else:
+                            cat = category or default_category_for_button() or None
+                            icon_obj = icon or default_icon_for_button() or None
+                            alarm_cat = alarm_pref or None
+
                         comp = Component(
                             name=name,
-                            zone=zone or None,
-                            category=category or None,
+                            zone=zone,
+                            category=cat,
+                            icon=icon_obj,
                             gateway=self.gateway_instance,
                             controller_uid=ctrl_uid,
                             base_type=bt_slug or '',
                             config=cfg,
+                            alarm_category=alarm_cat,
                         )
                         comp.save()
                         try:
