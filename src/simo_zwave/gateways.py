@@ -894,9 +894,20 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 self.logger.warning("MQTT discover ignored: driver not connected")
                 return
             try:
+                # Reset discovery state cleanly for this gateway
+                try:
+                    from simo_zwave.controllers import ZwaveDevice  # type: ignore
+                    # Use a small default timeout; wizard controls lifecycle
+                    self.gateway_instance.start_discovery(ZwaveDevice.uid, {}, timeout=120)
+                    self.logger.info("MQTT: discovery state reset for new inclusion")
+                except Exception:
+                    self.logger.error("Failed to reset discovery state", exc_info=True)
                 self.logger.info("MQTT: begin Z-Wave inclusion")
                 self._async_call(self._controller_command('add_node', None), timeout=10)
                 disc = self.gateway_instance.discovery or {}
+                # Clear any stale flags from previous sessions
+                for k in ('finished', 'locked_node', 'inclusion_stopped'):
+                    disc.pop(k, None)
                 disc['inclusion_started'] = time.time()
                 self.gateway_instance.discovery = disc
                 self.gateway_instance.save(update_fields=['discovery'])
