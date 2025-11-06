@@ -775,6 +775,9 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             if s_int == 3:  # NodeStatus.Dead
                 return False
             return True
+        except Exception:
+            # On unexpected errors, keep current availability unchanged by returning True
+            return True
 
     def _propagate_battery_level(self, node_id: int, level: int):
         """Update battery_level on all components bound to this node."""
