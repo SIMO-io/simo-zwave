@@ -834,9 +834,6 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             self._poll_battery_for_node(int(node_id))
         except Exception:
             pass
-        except Exception:
-            # On unexpected errors, keep current availability unchanged by returning True here
-            return True
 
     def _get_component_ids_for_value(self, node_id: int, cc: int, ep: int, prop: Any, pkey: Any):
         key = (int(node_id), int(cc), int(ep), str(prop), str(pkey) if pkey is not None else None)
