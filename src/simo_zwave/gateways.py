@@ -574,10 +574,17 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                                 out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
                             elif isinstance(out_val, (int, float)):
                                 out_val = bool(int(out_val))
+                        is_alive = self._is_node_alive(zw.get('nodeId'))
                         if self._should_push(comp.id, out_val):
-                            is_alive = self._is_node_alive(zw.get('nodeId'))
                             comp.controller._receive_from_device(out_val, is_alive=is_alive)
                             self._mark_pushed(comp.id, out_val)
+                        else:
+                            # Still propagate availability even when value is unchanged
+                            try:
+                                if getattr(comp, 'alive', None) != is_alive:
+                                    comp.controller._receive_from_device(comp.value, is_alive=is_alive)
+                            except Exception:
+                                pass
                     except Exception:
                         continue
             except Exception:
@@ -642,10 +649,17 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                                 out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
                             elif isinstance(out_val, (int, float)):
                                 out_val = bool(int(out_val))
+                        is_alive = self._is_node_alive(node_id)
                         if self._should_push(comp.id, out_val):
-                            is_alive = self._is_node_alive(node_id)
                             comp.controller._receive_from_device(out_val, is_alive=is_alive)
                             self._mark_pushed(comp.id, out_val)
+                        else:
+                            # Still propagate availability even when value is unchanged
+                            try:
+                                if getattr(comp, 'alive', None) != is_alive:
+                                    comp.controller._receive_from_device(comp.value, is_alive=is_alive)
+                            except Exception:
+                                pass
                     except Exception:
                         continue
             except Exception:
@@ -1529,11 +1543,17 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         elif isinstance(out_val, (int, float)):
                             out_val = bool(int(out_val))
                     # Dedup short-window to avoid duplicate history entries
-                    if not self._should_push(comp.id, out_val):
-                        continue
                     is_alive = self._is_node_alive(zw.get('nodeId'))
-                    comp.controller._receive_from_device(out_val, is_alive=is_alive)
-                    self._mark_pushed(comp.id, out_val)
+                    if self._should_push(comp.id, out_val):
+                        comp.controller._receive_from_device(out_val, is_alive=is_alive)
+                        self._mark_pushed(comp.id, out_val)
+                    else:
+                        # Still propagate availability even when value is unchanged
+                        try:
+                            if getattr(comp, 'alive', None) != is_alive:
+                                comp.controller._receive_from_device(comp.value, is_alive=is_alive)
+                        except Exception:
+                            pass
                 except Exception:
                     continue
         except Exception:
