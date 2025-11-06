@@ -575,7 +575,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                             elif isinstance(out_val, (int, float)):
                                 out_val = bool(int(out_val))
                         if self._should_push(comp.id, out_val):
-                            comp.controller._receive_from_device(out_val, is_alive=True)
+                            is_alive = self._is_node_alive(zw.get('nodeId'))
+                            comp.controller._receive_from_device(out_val, is_alive=is_alive)
                             self._mark_pushed(comp.id, out_val)
                     except Exception:
                         continue
@@ -642,7 +643,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                             elif isinstance(out_val, (int, float)):
                                 out_val = bool(int(out_val))
                         if self._should_push(comp.id, out_val):
-                            comp.controller._receive_from_device(out_val, is_alive=True)
+                            is_alive = self._is_node_alive(node_id)
+                            comp.controller._receive_from_device(out_val, is_alive=is_alive)
                             self._mark_pushed(comp.id, out_val)
                     except Exception:
                         continue
@@ -673,6 +675,18 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             nodemap.setdefault(int(node_id), []).append(row['id'])
         self._value_map = vmap
         self._node_to_components = nodemap
+
+    def _is_node_alive(self, node_id: int) -> bool:
+        """Best-effort check of node availability from driver status."""
+        try:
+            if not (self._client and getattr(self._client, 'driver', None) and self._client.connected):
+                return True
+            node = getattr(self._client.driver.controller, 'nodes', {}).get(int(node_id))
+            status = getattr(node, 'status', None)
+            # In Z-Wave JS, 3 corresponds to NodeStatus.Dead
+            return status != 3
+        except Exception:
+            return True
 
     def _get_component_ids_for_value(self, node_id: int, cc: int, ep: int, prop: Any, pkey: Any):
         key = (int(node_id), int(cc), int(ep), str(prop), str(pkey) if pkey is not None else None)
@@ -716,6 +730,19 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     is_dead = (status == 3)  # NodeStatus.Dead
                     if not is_dead:
                         continue
+                    # Ensure components are marked unavailable
+                    try:
+                        comp_ids = list(self._node_to_components.get(int(nid), []) or [])
+                        if comp_ids:
+                            def _prop(ids):
+                                for comp in Component.objects.filter(id__in=ids):
+                                    try:
+                                        comp.controller._receive_from_device(comp.value, is_alive=False)
+                                    except Exception:
+                                        pass
+                            asyncio.run_coroutine_threadsafe(asyncio.to_thread(_prop, comp_ids), self._loop)
+                    except Exception:
+                        pass
                     last = self._last_dead_ping.get(nid, 0)
                     if now - last < 9:
                         continue
@@ -1484,7 +1511,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     # Dedup short-window to avoid duplicate history entries
                     if not self._should_push(comp.id, out_val):
                         continue
-                    comp.controller._receive_from_device(out_val, is_alive=True)
+                    is_alive = self._is_node_alive(zw.get('nodeId'))
+                    comp.controller._receive_from_device(out_val, is_alive=is_alive)
                     self._mark_pushed(comp.id, out_val)
                 except Exception:
                     continue
