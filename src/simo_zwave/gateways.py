@@ -366,6 +366,17 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 if cc_here in (32, 48, 113):
                     # Don't block the event loop; fire-and-forget
                     asyncio.run_coroutine_threadsafe(asyncio.to_thread(self._poll_node_bound_values, node_id), self._loop)
+                # Battery level updates (CC 128) → propagate to all bound components
+                if cc_here == 128:
+                    prop = val.get('property') or val.get('propertyName')
+                    try:
+                        if str(prop).lower() == 'level':
+                            level = val.get('value')
+                            if isinstance(level, (int, float)):
+                                lvl = max(0, min(int(level), 100))
+                                asyncio.run_coroutine_threadsafe(asyncio.to_thread(self._propagate_battery_level, int(node_id), lvl), self._loop)
+                    except Exception:
+                        pass
             except Exception:
                 pass
             if val.get('commandClass') is None or (val.get('property') is None and val.get('propertyName') is None):
@@ -693,6 +704,11 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         continue
             except Exception:
                 self.logger.error("Config-bound per-node poll failed", exc_info=True)
+            # Also try to read battery level for this node
+            try:
+                self._poll_battery_for_node(int(node_id))
+            except Exception:
+                pass
         except Exception:
             self.logger.error(f"_poll_node_bound_values failed node={node_id}", exc_info=True)
 
@@ -756,6 +772,53 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             if s_int == 3:  # NodeStatus.Dead
                 return False
             return True
+
+    def _propagate_battery_level(self, node_id: int, level: int):
+        """Update battery_level on all components bound to this node."""
+        try:
+            comp_ids = list(self._node_to_components.get(int(node_id), []) or [])
+            if not comp_ids:
+                # ensure routing map is fresh
+                try:
+                    self._rebuild_config_map()
+                    comp_ids = list(self._node_to_components.get(int(node_id), []) or [])
+                except Exception:
+                    pass
+            if not comp_ids:
+                return
+            alive_now = self._is_node_alive(node_id)
+            for comp in Component.objects.filter(id__in=comp_ids):
+                try:
+                    comp.controller._receive_from_device(comp.value, is_alive=alive_now, battery_level=level)
+                except Exception:
+                    continue
+        except Exception:
+            try:
+                self.logger.error(f"Battery propagate failed node={node_id}", exc_info=True)
+            except Exception:
+                pass
+
+    def _poll_battery_for_node(self, node_id: int):
+        """Poll Battery CC level and propagate it, if available."""
+        try:
+            if not (self._client and self._client.connected):
+                return
+            vid = {'commandClass': 128, 'endpoint': 0, 'property': 'level'}
+            resp = self._async_call(self._client.async_send_command({
+                'command': 'node.get_value',
+                'nodeId': int(node_id),
+                'valueId': vid,
+            }), timeout=10)
+            level = None
+            if isinstance(resp, dict):
+                level = resp.get('value', resp.get('result'))
+            else:
+                level = resp
+            if isinstance(level, (int, float)):
+                self._propagate_battery_level(int(node_id), max(0, min(int(level), 100)))
+        except Exception:
+            # Silently ignore if CC not present
+            pass
         except Exception:
             # On unexpected errors, keep current availability unchanged by returning True here
             return True
@@ -1553,6 +1616,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         try:
             from simo.core.models import Component as _C
             comps = list(_C.objects.filter(gateway=self.gateway_instance, config__has_key='zwave')[:256])
+            polled_nodes = set()
             for comp in comps:
                 try:
                     zw = (comp.config or {}).get('zwave') or {}
@@ -1598,6 +1662,16 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                             pass
                 except Exception:
                     continue
+            # After value poll, try to fetch battery once per node
+            try:
+                for comp in comps:
+                    nid = ((comp.config or {}).get('zwave') or {}).get('nodeId')
+                    if nid in polled_nodes or nid is None:
+                        continue
+                    polled_nodes.add(nid)
+                    self._poll_battery_for_node(int(nid))
+            except Exception:
+                pass
         except Exception:
             self.logger.error("All-bound poll failed", exc_info=True)
 
