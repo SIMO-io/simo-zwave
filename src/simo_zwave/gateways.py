@@ -54,6 +54,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         # Config-driven routing caches for Component.config-based mapping
         self._value_map: Dict[tuple, list] = {}
         self._node_to_components: Dict[int, list] = {}
+        # Throttles
+        self._last_battery_poll: Dict[int, float] = {}
         
 
     # --------------- Helpers ---------------
@@ -705,8 +707,9 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             except Exception:
                 self.logger.error("Config-bound per-node poll failed", exc_info=True)
             # Also try to read battery level for this node
+            # Throttled battery poll
             try:
-                self._poll_battery_for_node(int(node_id))
+                self._maybe_poll_battery_for_node(int(node_id))
             except Exception:
                 pass
         except Exception:
@@ -818,6 +821,18 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 self._propagate_battery_level(int(node_id), max(0, min(int(level), 100)))
         except Exception:
             # Silently ignore if CC not present
+            pass
+
+    def _maybe_poll_battery_for_node(self, node_id: int, min_interval: int = 3600):
+        """Poll battery for node if past throttle window (default 1 hour)."""
+        try:
+            now = time.time()
+            last = self._last_battery_poll.get(int(node_id), 0)
+            if (now - last) < min_interval:
+                return
+            self._last_battery_poll[int(node_id)] = now
+            self._poll_battery_for_node(int(node_id))
+        except Exception:
             pass
         except Exception:
             # On unexpected errors, keep current availability unchanged by returning True here
@@ -1669,7 +1684,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     if nid in polled_nodes or nid is None:
                         continue
                     polled_nodes.add(nid)
-                    self._poll_battery_for_node(int(nid))
+                    self._maybe_poll_battery_for_node(int(nid))
             except Exception:
                 pass
         except Exception:
