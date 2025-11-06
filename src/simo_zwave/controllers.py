@@ -248,14 +248,12 @@ class ZwaveDynamicConfigMixin:
         self._CFG_CACHE[key] = {'ts': now, 'data': data}
         return data
 
+
 class ZwaveBinarySensor(ZwaveDynamicConfigMixin, BinarySensor):
     gateway_class = ZwaveGatewayHandler
     config_form = BaseComponentForm
     manual_add = False
 
-    def _receive_from_device(self, val, **kwargs):
-        # Ensure boolean mapping, propagate is_alive/battery_level if provided
-        return super()._receive_from_device(bool(val), **kwargs)
 
 class ZwaveNumericSensor(ZwaveDynamicConfigMixin, NumericSensor):
     gateway_class = ZwaveGatewayHandler
@@ -267,9 +265,6 @@ class ZwaveSwitch(ZwaveDynamicConfigMixin, Switch):
     gateway_class = ZwaveGatewayHandler
     config_form = ZwaveSwitchConfigForm
     manual_add = False
-
-    def _receive_from_device(self, val, **kwargs):
-        return super()._receive_from_device(bool(val), **kwargs)
 
 
 class ZwaveDimmer(ZwaveDynamicConfigMixin, Dimmer):
@@ -307,10 +302,6 @@ class ZwaveRGBWLight(ZwaveDynamicConfigMixin, RGBWLight):
     gateway_class = ZwaveGatewayHandler
     config_form = RGBLightComponentConfigForm
     manual_add = False
-
-    def _receive_from_device(self, val, **kwargs):
-        # TODO: need to addapt to map type RGBWLight value.
-        return super()._receive_from_device(val, **kwargs)
 
 
 class ZwaveButton(ZwaveDynamicConfigMixin, Button):

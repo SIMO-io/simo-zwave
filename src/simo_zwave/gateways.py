@@ -441,11 +441,20 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                             elif isinstance(out_val, (int, float)):
                                 out_val = bool(int(out_val))
                         def _push_to_components(ids, value):
+                            # Derive current availability from driver for this node
+                            alive_now = self._is_node_alive(int(node_id))
                             for comp in Component.objects.filter(id__in=ids):
                                 try:
                                     if self._should_push(comp.id, value):
-                                        comp.controller._receive_from_device(value, is_alive=True)
+                                        comp.controller._receive_from_device(value, is_alive=alive_now)
                                         self._mark_pushed(comp.id, value)
+                                    else:
+                                        # Even if value is unchanged, still propagate availability flips
+                                        try:
+                                            if getattr(comp, 'alive', None) != alive_now:
+                                                comp.controller._receive_from_device(comp.value, is_alive=alive_now)
+                                        except Exception:
+                                            pass
                                 except Exception:
                                     try:
                                         self.logger.error(
@@ -559,11 +568,21 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         vid = self._build_value_id_for_read(zw)
                         if not vid.get('commandClass') or vid.get('property') is None:
                             continue
-                        resp = self._async_call(self._client.async_send_command({
-                            'command': 'node.get_value',
-                            'nodeId': zw.get('nodeId'),
-                            'valueId': vid,
-                        }), timeout=10)
+                        try:
+                            resp = self._async_call(self._client.async_send_command({
+                                'command': 'node.get_value',
+                                'nodeId': zw.get('nodeId'),
+                                'valueId': vid,
+                            }), timeout=10)
+                        except Exception:
+                            # Even if value read fails (eg node dead), still propagate availability
+                            is_alive = self._is_node_alive(zw.get('nodeId'))
+                            try:
+                                if getattr(comp, 'alive', None) != is_alive:
+                                    comp.controller._receive_from_device(comp.value, is_alive=is_alive)
+                            except Exception:
+                                pass
+                            continue
                         cur = resp.get('value', resp.get('result')) if isinstance(resp, dict) else resp
                         out_val = cur
                         cc_here = zw.get('cc')
@@ -634,11 +653,21 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         vid = self._build_value_id_for_read(zw)
                         if not vid.get('commandClass') or not vid.get('property'):
                             continue
-                        resp = self._async_call(self._client.async_send_command({
-                            'command': 'node.get_value',
-                            'nodeId': node_id,
-                            'valueId': vid,
-                        }), timeout=10)
+                        try:
+                            resp = self._async_call(self._client.async_send_command({
+                                'command': 'node.get_value',
+                                'nodeId': node_id,
+                                'valueId': vid,
+                            }), timeout=10)
+                        except Exception:
+                            # On read failure, at least propagate availability
+                            is_alive = self._is_node_alive(node_id)
+                            try:
+                                if getattr(comp, 'alive', None) != is_alive:
+                                    comp.controller._receive_from_device(comp.value, is_alive=is_alive)
+                            except Exception:
+                                pass
+                            continue
                         cur = resp.get('value', resp.get('result')) if isinstance(resp, dict) else resp
                         out_val = cur
                         cc_here = zw.get('cc')
@@ -682,29 +711,38 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             ep = zw.get('endpoint') or 0
             prop = zw.get('property')
             pkey = zw.get('propertyKey') or None
-            if node_id is None or cc is None or prop is None:
+            if node_id is None:
+                continue
+            # Always map node -> components to propagate availability even if value binding is incomplete
+            nodemap.setdefault(int(node_id), []).append(row['id'])
+            # Only map value routing when value binding is complete
+            if cc is None or prop is None:
                 continue
             key = (int(node_id), int(cc), int(ep), str(prop), str(pkey) if pkey is not None else None)
             vmap.setdefault(key, []).append(row['id'])
-            nodemap.setdefault(int(node_id), []).append(row['id'])
         self._value_map = vmap
         self._node_to_components = nodemap
 
     def _is_node_alive(self, node_id: int) -> bool:
-        """Check node availability using the driver's node status.
+        """Return current availability for a node from the driver model.
 
-        Returns False when the node is missing in the driver map or explicitly
-        marked Dead. Robust to int/enum/string representations of status.
+        - Prefers the boolean `node.is_alive` when present.
+        - Falls back to inspecting `node.status` for 'dead' or enum value 3.
+        - If no driver context is available, returns True (don't flap to offline).
         """
         try:
             if not (self._client and getattr(self._client, 'driver', None) and self._client.connected):
-                # If we don't have a driver context, don't flip availability here
                 return True
             node = getattr(self._client.driver.controller, 'nodes', {}).get(int(node_id))
             if not node:
                 return False
+            # Prefer dedicated boolean if exposed by zwave-js-server-python
+            if hasattr(node, 'is_alive'):
+                try:
+                    return bool(getattr(node, 'is_alive'))
+                except Exception:
+                    pass
             status = getattr(node, 'status', None)
-            # Normalize to string and int checks
             try:
                 s_txt = str(status).lower()
             except Exception:
@@ -750,18 +788,12 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         try:
             if not (self._client and getattr(self._client, 'driver', None) and self._client.connected):
                 return
-            try:
-                nodes_map = getattr(self._client.driver.controller, 'nodes', {}) or {}
-            except Exception:
-                nodes_map = {}
             # Only consider nodes referenced by components in this gateway
             candidate_ids = set(self._node_to_components.keys())
             now = time.time()
             for nid in candidate_ids:
                 try:
-                    node = nodes_map.get(nid)
-                    status = getattr(node, 'status', None)
-                    is_dead = (status == 3)  # NodeStatus.Dead
+                    is_dead = not self._is_node_alive(nid)
                     if not is_dead:
                         continue
                     # Ensure components are marked unavailable
@@ -1527,11 +1559,21 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     vid = self._build_value_id_for_read(zw)
                     if not vid.get('commandClass') or vid.get('property') is None:
                         continue
-                    resp = self._async_call(self._client.async_send_command({
-                        'command': 'node.get_value',
-                        'nodeId': zw.get('nodeId'),
-                        'valueId': vid,
-                    }), timeout=10)
+                    try:
+                        resp = self._async_call(self._client.async_send_command({
+                            'command': 'node.get_value',
+                            'nodeId': zw.get('nodeId'),
+                            'valueId': vid,
+                        }), timeout=10)
+                    except Exception:
+                        # Even if the read fails (eg node dead), still push availability state
+                        is_alive = self._is_node_alive(zw.get('nodeId'))
+                        try:
+                            if getattr(comp, 'alive', None) != is_alive:
+                                comp.controller._receive_from_device(comp.value, is_alive=is_alive)
+                        except Exception:
+                            pass
+                        continue
                     cur = resp.get('value', resp.get('result')) if isinstance(resp, dict) else resp
                     out_val = cur
                     cc_here = zw.get('cc')
