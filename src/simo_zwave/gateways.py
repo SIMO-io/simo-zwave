@@ -45,15 +45,15 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         self._client: Optional[ZJSClient] = None
         self._thread: Optional[threading.Thread] = None
         self._connected = False
-        self._last_state: Dict[str, Any] = {}
         self._last_node_refresh: Dict[int, float] = {}
-        self._last_sync_log: float = 0.0
         self._last_dead_ping: Dict[int, float] = {}
         self._last_push: Dict[int, Any] = {}
         self._last_node_labels: Dict[int, tuple] = {}
         # Config-driven routing caches for Component.config-based mapping
         self._value_map: Dict[tuple, list] = {}
         self._node_to_components: Dict[int, list] = {}
+        # Throttles
+        self._last_battery_poll: Dict[int, float] = {}
         # Throttles
         self._last_battery_poll: Dict[int, float] = {}
         
@@ -261,60 +261,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 self.logger.error(f"Failed to attach listeners for node {getattr(node,'node_id',None)}", exc_info=True)
                 continue
 
-    def _on_mqtt_message(self, client, userdata, msg):
-        # Extend base handling with a lightweight 'discover' trigger for inclusion
-        super()._on_mqtt_message(client, userdata, msg)
-        try:
-            # Ensure current discovery state reflects latest form init_data
-            try:
-                self.gateway_instance.refresh_from_db(fields=['discovery'])
-            except Exception:
-                pass
-            payload = json.loads(msg.payload)
-        except Exception:
-            return
-        cmd = payload.get('command')
-        if cmd != 'discover':
-            return
-        # Start inclusion only when asked to discover ZwaveDevice
-        typ = payload.get('type')
-        try:
-            from simo_zwave.controllers import ZwaveDevice  # type: ignore
-            zw_uid = ZwaveDevice.uid
-        except Exception:
-            zw_uid = None
-        if not zw_uid or typ != zw_uid:
-            try:
-                self.logger.info(f"MQTT discover ignored: type mismatch typ='{typ}' expected='{zw_uid}'")
-            except Exception:
-                pass
-            return
-        try:
-            if not (self._client and self._client.connected):
-                self.logger.warning("MQTT discover ignored: driver not connected")
-                return
-            self.logger.info("MQTT: begin Z-Wave inclusion")
-            self._async_call(self._controller_command('add_node', None), timeout=10)
-            try:
-                self.gateway_instance.refresh_from_db(fields=['discovery'])
-            except Exception:
-                pass
-            try:
-                self.gateway_instance.refresh_from_db(fields=['discovery'])
-            except Exception:
-                pass
-            disc = self.gateway_instance.discovery or {}
-            disc['inclusion_started'] = time.time()
-            self.gateway_instance.discovery = disc
-            try:
-                self.gateway_instance.save(update_fields=['discovery'])
-            except Exception:
-                pass
-        except Exception:
-            try:
-                self.logger.error("Failed to begin inclusion from MQTT discover", exc_info=True)
-            except Exception:
-                pass
+    # (Note: consolidated MQTT handler is defined later in the file)
 
     def _on_value_event(self, event, node=None):
         try:
@@ -394,7 +341,7 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                     pass
                 return
             try:
-                self.logger.info(
+                self.logger.debug(
                     f"Event value node={node_id} cc={val.get('commandClass')} ep={val.get('endpoint')} prop={val.get('property')} key={val.get('propertyKey')} val={val.get('value')}"
                 )
             except Exception:
@@ -445,37 +392,10 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 if cc is not None and prop is not None:
                     comp_ids = self._get_component_ids_for_value(node_id, cc, ep, prop, pkey)
                     if comp_ids:
-                        out_val = ev_value
-                        if cc == 48 and isinstance(out_val, (int, float)):
-                            out_val = bool(int(out_val))
-                        if cc == 113:
-                            if isinstance(out_val, str):
-                                out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
-                            elif isinstance(out_val, (int, float)):
-                                out_val = bool(int(out_val))
+                        out_val = self._normalize_cc_value(cc, ev_value)
                         def _push_to_components(ids, value):
-                            # Derive current availability from driver for this node
-                            alive_now = self._is_node_alive(int(node_id))
                             for comp in Component.objects.filter(id__in=ids):
-                                try:
-                                    if self._should_push(comp.id, value):
-                                        comp.controller._receive_from_device(value, is_alive=alive_now)
-                                        self._mark_pushed(comp.id, value)
-                                    else:
-                                        # Even if value is unchanged, still propagate availability flips
-                                        try:
-                                            if getattr(comp, 'alive', None) != alive_now:
-                                                comp.controller._receive_from_device(comp.value, is_alive=alive_now)
-                                        except Exception:
-                                            pass
-                                except Exception:
-                                    try:
-                                        self.logger.error(
-                                            f"Fast-path event push failed comp={getattr(comp,'id',None)} node={node_id} cc={cc} ep={ep} prop={prop}",
-                                            exc_info=True,
-                                        )
-                                    except Exception:
-                                        pass
+                                self._push_value(comp, value, node_id=node_id)
                         asyncio.run_coroutine_threadsafe(asyncio.to_thread(_push_to_components, comp_ids, out_val), self._loop)
             except Exception:
                 # Do not block event processing
@@ -597,26 +517,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                                 pass
                             continue
                         cur = resp.get('value', resp.get('result')) if isinstance(resp, dict) else resp
-                        out_val = cur
-                        cc_here = zw.get('cc')
-                        if cc_here == 48 and isinstance(out_val, (int, float)):
-                            out_val = bool(int(out_val))
-                        if cc_here == 113:
-                            if isinstance(out_val, str):
-                                out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
-                            elif isinstance(out_val, (int, float)):
-                                out_val = bool(int(out_val))
-                        is_alive = self._is_node_alive(zw.get('nodeId'))
-                        if self._should_push(comp.id, out_val):
-                            comp.controller._receive_from_device(out_val, is_alive=is_alive)
-                            self._mark_pushed(comp.id, out_val)
-                        else:
-                            # Still propagate availability even when value is unchanged
-                            try:
-                                if getattr(comp, 'alive', None) != is_alive:
-                                    comp.controller._receive_from_device(comp.value, is_alive=is_alive)
-                            except Exception:
-                                pass
+                        out_val = self._normalize_cc_value(zw.get('cc'), cur)
+                        self._push_value(comp, out_val, node_id=zw.get('nodeId'))
                     except Exception:
                         continue
             except Exception:
@@ -682,26 +584,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                                 pass
                             continue
                         cur = resp.get('value', resp.get('result')) if isinstance(resp, dict) else resp
-                        out_val = cur
-                        cc_here = zw.get('cc')
-                        if cc_here == 48 and isinstance(out_val, (int, float)):
-                            out_val = bool(int(out_val))
-                        if cc_here == 113:
-                            if isinstance(out_val, str):
-                                out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
-                            elif isinstance(out_val, (int, float)):
-                                out_val = bool(int(out_val))
-                        is_alive = self._is_node_alive(node_id)
-                        if self._should_push(comp.id, out_val):
-                            comp.controller._receive_from_device(out_val, is_alive=is_alive)
-                            self._mark_pushed(comp.id, out_val)
-                        else:
-                            # Still propagate availability even when value is unchanged
-                            try:
-                                if getattr(comp, 'alive', None) != is_alive:
-                                    comp.controller._receive_from_device(comp.value, is_alive=is_alive)
-                            except Exception:
-                                pass
+                        out_val = self._normalize_cc_value(zw.get('cc'), cur)
+                        self._push_value(comp, out_val, node_id=node_id)
                     except Exception:
                         continue
             except Exception:
@@ -1220,6 +1104,47 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
             except Exception:
                 pass
 
+    # ---------- Small helpers to reduce duplication ----------
+    def _driver_ready(self) -> bool:
+        return bool(self._client and self._client.connected)
+
+    @staticmethod
+    def _normalize_cc_value(cc: Optional[int], raw: Any) -> Any:
+        try:
+            if cc == 48:  # Binary Sensor
+                if isinstance(raw, (int, float)):
+                    return bool(int(raw))
+            if cc == 113:  # Notification
+                if isinstance(raw, str):
+                    return str(raw).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
+                if isinstance(raw, (int, float)):
+                    return bool(int(raw))
+        except Exception:
+            pass
+        return raw
+
+    def _push_value(self, comp: 'Component', value: Any, node_id: Optional[int] = None):
+        try:
+            alive = self._is_node_alive(int(node_id)) if node_id is not None else True
+        except Exception:
+            alive = True
+        try:
+            if self._should_push(comp.id, value):
+                comp.controller._receive_from_device(value, is_alive=alive)
+                self._mark_pushed(comp.id, value)
+            else:
+                # Value unchanged; still propagate availability flips
+                try:
+                    if getattr(comp, 'alive', None) != alive:
+                        comp.controller._receive_from_device(comp.value, is_alive=alive)
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                self.logger.error(f"Push failed for comp={getattr(comp,'id',None)}", exc_info=True)
+            except Exception:
+                pass
+
     def _build_value_id_from_config(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         def _coerce(val: Any) -> Any:
             if isinstance(val, str) and val.isdigit():
@@ -1646,35 +1571,11 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                         }), timeout=10)
                     except Exception:
                         # Even if the read fails (eg node dead), still push availability state
-                        is_alive = self._is_node_alive(zw.get('nodeId'))
-                        try:
-                            if getattr(comp, 'alive', None) != is_alive:
-                                comp.controller._receive_from_device(comp.value, is_alive=is_alive)
-                        except Exception:
-                            pass
+                        self._push_value(comp, comp.value, node_id=zw.get('nodeId'))
                         continue
                     cur = resp.get('value', resp.get('result')) if isinstance(resp, dict) else resp
-                    out_val = cur
-                    cc_here = zw.get('cc')
-                    if cc_here == 48 and isinstance(out_val, (int, float)):
-                        out_val = bool(int(out_val))
-                    if cc_here == 113:
-                        if isinstance(out_val, str):
-                            out_val = str(out_val).strip().lower() not in ('idle', 'inactive', 'clear', 'unknown', 'no event')
-                        elif isinstance(out_val, (int, float)):
-                            out_val = bool(int(out_val))
-                    # Dedup short-window to avoid duplicate history entries
-                    is_alive = self._is_node_alive(zw.get('nodeId'))
-                    if self._should_push(comp.id, out_val):
-                        comp.controller._receive_from_device(out_val, is_alive=is_alive)
-                        self._mark_pushed(comp.id, out_val)
-                    else:
-                        # Still propagate availability even when value is unchanged
-                        try:
-                            if getattr(comp, 'alive', None) != is_alive:
-                                comp.controller._receive_from_device(comp.value, is_alive=is_alive)
-                        except Exception:
-                            pass
+                    out_val = self._normalize_cc_value(zw.get('cc'), cur)
+                    self._push_value(comp, out_val, node_id=zw.get('nodeId'))
                 except Exception:
                     continue
             # After value poll, try to fetch battery once per node
