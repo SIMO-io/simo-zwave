@@ -677,15 +677,35 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
         self._node_to_components = nodemap
 
     def _is_node_alive(self, node_id: int) -> bool:
-        """Best-effort check of node availability from driver status."""
+        """Check node availability using the driver's node status.
+
+        Returns False when the node is missing in the driver map or explicitly
+        marked Dead. Robust to int/enum/string representations of status.
+        """
         try:
             if not (self._client and getattr(self._client, 'driver', None) and self._client.connected):
+                # If we don't have a driver context, don't flip availability here
                 return True
             node = getattr(self._client.driver.controller, 'nodes', {}).get(int(node_id))
+            if not node:
+                return False
             status = getattr(node, 'status', None)
-            # In Z-Wave JS, 3 corresponds to NodeStatus.Dead
-            return status != 3
+            # Normalize to string and int checks
+            try:
+                s_txt = str(status).lower()
+            except Exception:
+                s_txt = ''
+            try:
+                s_int = int(status)
+            except Exception:
+                s_int = None
+            if 'dead' in s_txt:
+                return False
+            if s_int == 3:  # NodeStatus.Dead
+                return False
+            return True
         except Exception:
+            # On unexpected errors, keep current availability unchanged by returning True here
             return True
 
     def _get_component_ids_for_value(self, node_id: int, cc: int, ep: int, prop: Any, pkey: Any):
@@ -1469,8 +1489,8 @@ class ZwaveGatewayHandler(BaseObjectCommandsGatewayHandler):
                 for nid, comp_ids in (self._node_to_components or {}).items():
                     try:
                         node = nodes_map.get(nid)
-                        status = getattr(node, 'status', None)
-                        is_alive = status != 3
+                        # If node missing treat as dead; otherwise use helper
+                        is_alive = self._is_node_alive(nid)
                         def _push(ids, alive):
                             for comp in Component.objects.filter(id__in=ids):
                                 try:
